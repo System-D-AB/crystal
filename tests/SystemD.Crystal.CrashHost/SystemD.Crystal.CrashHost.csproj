@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A separate program the crash tests start and kill at a named step (spec 005 R13.2, R13.5; tasks T21).
+       It uses the built package as an application would, which is also the playbook's "real run". -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SystemD.Crystal\SystemD.Crystal.csproj" />
+  </ItemGroup>
+
+</Project>

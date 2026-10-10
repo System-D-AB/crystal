@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Multi-process tests: nodes in their own processes, hard kills (spec 004 R1.1, task T1). Slower than the unit
+       tests, so CI runs them as their own step. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SystemD.Crystal\SystemD.Crystal.csproj" />
+    <!-- Built and copied beside the tests, which start them and kill them. -->
+    <ProjectReference Include="..\SystemD.Crystal.NodeHost\SystemD.Crystal.NodeHost.csproj" />
+    <ProjectReference Include="..\..\tools\SystemD.Crystal.CrashHarness\SystemD.Crystal.CrashHarness.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The stream the harness writes, compiled here too, so the audit and the writer never disagree. -->
+    <Compile Include="..\..\tools\SystemD.Crystal.CrashHarness\CrashStream.cs" Link="Support\CrashStream.cs" />
+  </ItemGroup>
+
+</Project>

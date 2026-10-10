@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- One Crystal node in its own process, driven by the process tests through TestNode (spec 004 R2.2, task T3).
+       It uses the built package as an application would. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SystemD.Crystal\SystemD.Crystal.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,41 @@
+# .NET build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+*.user
+
+# Test results
+[Tt]est[Rr]esults/
+*.trx
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Local data directories (Crystal stores)
+data/
+*.crystal-data/
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# AI agent files: kept on contributors' machines, never published. AGENTS.md is the one shared, generic file.
+CLAUDE.md
+GEMINI.md
+.claude/
+.kiro/
+.agents/
+.cursor/
+.codex/
+.gemini/
+.qwen/
+.windsurf/
+.github/copilot-instructions.md

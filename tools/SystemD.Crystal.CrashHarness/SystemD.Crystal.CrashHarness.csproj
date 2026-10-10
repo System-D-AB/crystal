@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The program the crash tests kill (spec 004 R2.3, task T4). It writes a deterministic stream of batches and
+       acknowledges each one after it commits; a test kills it at a random point and audits what survived. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Crystal's public API only, as a product would use it. -->
+    <ProjectReference Include="..\..\src\SystemD.Crystal\SystemD.Crystal.csproj" />
+  </ItemGroup>
+
+</Project>

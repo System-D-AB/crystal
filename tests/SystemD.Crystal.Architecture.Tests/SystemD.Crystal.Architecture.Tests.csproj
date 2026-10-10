@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <!-- Needed only by the R3.4 mutation samples, which plant deliberate RocksDB violations
+         so the rules can be seen to catch them. The kernel never exposes a RocksDB type. -->
+    <PackageReference Include="RocksDB" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SystemD.Crystal\SystemD.Crystal.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- The RocksDB binding's size-estimate call takes pinned key/length arrays and an output
+         buffer by pointer (spec 001-2 R2.3); NativeRocks.ApproximateSizes needs unsafe. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- Package metadata (spec 001 R5.1). One package, SystemD.Crystal, with symbols.
+       Nothing is published in this spec (R5.2). -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>SystemD.Crystal</PackageId>
+    <Version>0.1.0-preview.1</Version>
+    <Authors>SystemD.Crystal contributors</Authors>
+    <Description>A minimal, embedded storage kernel for .NET on RocksDB: isolated boxes, atomic multi-key batches, snapshots and bounded ordered scans, chosen durability, replication, and format stamps. Pre-release skeleton.</Description>
+    <PackageTags>rocksdb;storage;embedded;key-value;kernel</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- TODO(repo): set to the real repository URL before the first publish (spec 001 open question 5). -->
+    <RepositoryUrl>https://example.invalid/systemd-crystal</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="PackageReadme.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="RocksDB" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+  <!-- InternalsVisibleTo for the test projects (design § 5): the smoke test and
+       architecture tests reach internal SystemD.Crystal.Storage types. -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>SystemD.Crystal.Tests</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>SystemD.Crystal.Architecture.Tests</_Parameter1>
+    </AssemblyAttribute>
+    <!-- The crash host sets the internal test hook on CrystalOptions (spec 005 design addendum A8). -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>SystemD.Crystal.CrashHost</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

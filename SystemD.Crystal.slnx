@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SystemD.Crystal/SystemD.Crystal.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SystemD.Crystal.Tests/SystemD.Crystal.Tests.csproj" />
+    <Project Path="tests/SystemD.Crystal.Architecture.Tests/SystemD.Crystal.Architecture.Tests.csproj" />
+    <Project Path="tests/SystemD.Crystal.CrashHost/SystemD.Crystal.CrashHost.csproj" />
+    <Project Path="tests/SystemD.Crystal.NodeHost/SystemD.Crystal.NodeHost.csproj" />
+    <Project Path="tests/SystemD.Crystal.Process.Tests/SystemD.Crystal.Process.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/SystemD.Crystal.CrashHarness/SystemD.Crystal.CrashHarness.csproj" />
+    <Project Path="tools/SystemD.Crystal.Bench/SystemD.Crystal.Bench.csproj" />
+  </Folder>
+</Solution>
