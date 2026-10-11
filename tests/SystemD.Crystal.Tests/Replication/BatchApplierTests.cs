@@ -77,16 +77,59 @@ public sealed class BatchApplierTests
     }
 
     [Fact]
-    public void NonContiguousRun_IsAppliedBatchByBatch()
+    public void APageWithAHole_IsRefusedWhole_WritingNothing()
     {
+        // 1 (count 1) then 5 (count 1): 2..4 are missing. Writing it would number the second batch 2 on the standby, and
+        // every position after it would stop matching the primary's (003 should-fix 7; this test used to expect both
+        // batches written one by one).
         var target = new FakeTarget { Watermark = 0 };
         var applier = new BatchApplier(target);
 
-        // 1 (count 1) then 5 (count 1): a gap at 2..4, so not concatenated — written one by one.
         var result = applier.ApplyPage(epoch: 1, [Entry(1, 1), Entry(5, 1)]);
 
+        Assert.Equal(ApplyStatus.NotContiguous, result.Status);
+        Assert.Equal(0, result.Applied);
+        Assert.Empty(target.Writes);
+    }
+
+    [Fact]
+    public void APageThatDoesNotStartAfterThePosition_IsRefused()
+    {
+        var target = new FakeTarget { Watermark = 3 };
+        var applier = new BatchApplier(target);
+
+        var result = applier.ApplyPage(epoch: 1, [Entry(6, 2)]); // 4 and 5 are missing
+
+        Assert.Equal(ApplyStatus.NotContiguous, result.Status);
+        Assert.Empty(target.Writes);
+    }
+
+    [Fact]
+    public void ABatchStraddlingThePosition_IsRefused_NotSkippedWhole()
+    {
+        // 3..6 straddles a position of 4: skipping it would silently lose 5 and 6 (nothing after it shows the hole);
+        // writing it would apply 3 and 4 twice.
+        var target = new FakeTarget { Watermark = 4 };
+        var applier = new BatchApplier(target);
+
+        var result = applier.ApplyPage(epoch: 1, [Entry(3, 4)]);
+
+        Assert.Equal(ApplyStatus.NotContiguous, result.Status);
+        Assert.Empty(target.Writes);
+    }
+
+    [Fact]
+    public void ARePulledPage_ThenItsContinuation_IsAppliedFromThePosition()
+    {
+        var target = new FakeTarget { Watermark = 4 };
+        var applier = new BatchApplier(target);
+
+        var result = applier.ApplyPage(epoch: 1, [Entry(1, 2), Entry(3, 2), Entry(5, 3), Entry(8, 1)]);
+
+        Assert.Equal(ApplyStatus.Applied, result.Status);
+        Assert.Equal(2, result.Skipped);
         Assert.Equal(2, result.Applied);
-        Assert.Equal(2, target.Writes.Count);
+        Assert.Single(target.Writes); // 5..8 as one write
     }
 
     [Fact]

@@ -123,6 +123,35 @@ public sealed class ReplicationProtocolTests
     }
 
     [Fact]
+    public async Task APeerThatKeepsSayingHello_IsClosedWhenTheDeadlineFromConnectRunsOut()
+    {
+        // The pre-AUTH deadline counts from the connection, not from each request (003 should-fix 8).
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var (server, client) = DuplexPair();
+        var conn = new ReplicationConnection(server, new FakeSource(), "test:0", logger: null, preAuthTimeout: TimeSpan.FromMilliseconds(600));
+        var serve = conn.ServeAsync(cts.Token);
+        var raw = new RawClient(client);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!serve.IsCompleted && sw.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            try
+            {
+                await raw.HelloAsync(cts.Token); // a new request every 200 ms, never AUTH
+            }
+            catch (Exception)
+            {
+                break; // the server closed
+            }
+
+            await Task.Delay(200, cts.Token);
+        }
+
+        await serve.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"closed after {sw.Elapsed.TotalMilliseconds:F0} ms of HELLOs");
+    }
+
+    [Fact]
     public async Task ReplayedResponse_OnANewConnection_IsRefused()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));

@@ -39,14 +39,18 @@ internal sealed class ReplicationConnection
     // The peer's role and epoch from HELLO, acted on only once AUTH proves it holds the secret (003 addendum B1).
     private string _peerRole = string.Empty;
     private long _peerEpoch;
+    private CancellationToken _preAuthDeadline;
 
-    public ReplicationConnection(Stream stream, IReplicationSource source, string remote, ILogger? logger)
+    public ReplicationConnection(Stream stream, IReplicationSource source, string remote, ILogger? logger, TimeSpan? preAuthTimeout = null)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _remote = remote;
         _logger = logger;
+        _preAuthTimeout = preAuthTimeout ?? ReplicationProtocol.PreAuthTimeout;
     }
+
+    private readonly TimeSpan _preAuthTimeout;
 
     /// <summary>
     /// Serves the connection until it closes or <paramref name="cancellationToken"/> fires. Returns when the peer
@@ -54,6 +58,10 @@ internal sealed class ReplicationConnection
     /// </summary>
     public async Task ServeAsync(CancellationToken cancellationToken)
     {
+        // One deadline from the moment the connection is served, not restarted by each request (003 should-fix 8): a
+        // peer that keeps sending HELLO without authenticating is closed when it runs out.
+        using var preAuth = new CancellationTokenSource(_preAuthTimeout);
+        _preAuthDeadline = preAuth.Token;
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -247,11 +255,9 @@ internal sealed class ReplicationConnection
     /// </summary>
     private async Task<IReadOnlyList<byte[]>?> ReadRequestAsync(int cap, CancellationToken ct)
     {
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        if (!_authenticated)
-        {
-            timeoutCts.CancelAfter(ReplicationProtocol.PreAuthTimeout);
-        }
+        using var timeoutCts = _authenticated
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, _preAuthDeadline);
 
         while (true)
         {

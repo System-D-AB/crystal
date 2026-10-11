@@ -588,3 +588,15 @@ reviews of the fixes found more, also fixed. Tests: `tests/SystemD.Crystal.Tests
   primary's certificate name. Tests (`TlsTests`, 5, with a test CA issuing node certificates): replication over mutual
   TLS end to end; refused when the standby does not trust the primary, when the primary does not trust the standby's
   certificate, and when the standby has no TLS; a certificate for another host refused. Four mutations, each caught.
+- **Should-fix 7, contiguity (2026-10-11).** The applier skipped batches by their first sequence and wrote the rest
+  without checking that they continued the database: a page with a hole was written batch by batch (a test asserted
+  that), and a batch straddling the position was skipped whole, losing its newer half. RocksDB numbers a written batch
+  from the standby's own next sequence, so either would misalign every later position. Now the first new batch must
+  follow the position and each next where the last ended; otherwise the page is refused whole (`NotContiguous`) and
+  the database re-bootstraps. Tests (`BatchApplierTests`, 4 replacing 1). Two mutations, each caught. Not covered by
+  a test: the follower's re-bootstrap on `NotContiguous` (a primary sends no such page).
+- **Should-fix 8, connection limits (2026-10-11).** The pre-AUTH timeout restarted with every request, so a peer
+  sending HELLO every few seconds stayed connected unauthenticated; the TLS handshake had no deadline; the listener had
+  no cap. Now one deadline counts from the connection (and bounds the TLS handshake), and the listener keeps at most
+  `MaxConnections` (new option, default 64). Tests (`ReplicationProtocolTests` 1, `ConnectionLimitTests` 1). Two
+  mutations, each caught.

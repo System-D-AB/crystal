@@ -505,6 +505,11 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                     {
                         appliedAnything = true;
                     }
+                    else if (result.Status == ApplyStatus.NotContiguous)
+                    {
+                        // Nothing was written; continuing would misalign every position after it (003 should-fix 7).
+                        MarkAndReBootstrap(entry.Uid, "gap (a page that does not continue the database)");
+                    }
 
                     break;
                 case var s when s == ReplicationProtocol.EntryGap:

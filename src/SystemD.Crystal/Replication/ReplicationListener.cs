@@ -24,6 +24,10 @@ internal sealed class ReplicationListener : IDisposable
     private readonly ReplicationOptions _options;
     private readonly ILogger? _logger;
     private readonly CancellationTokenSource _stopping = new();
+    private int _open;
+
+    /// <summary>Connections open now (tests of the cap).</summary>
+    internal int OpenConnections => Volatile.Read(ref _open);
     private Task? _acceptLoop;
     private int _disposed;
 
@@ -70,6 +74,15 @@ internal sealed class ReplicationListener : IDisposable
                 return;
             }
 
+            // At the cap, the newest connection is closed at once (003 should-fix 8): many peers, authenticated or not,
+            // cannot hold the listener's threads and memory without bound.
+            if (Interlocked.Increment(ref _open) > Math.Max(1, _options.MaxConnections))
+            {
+                Interlocked.Decrement(ref _open);
+                client.Dispose();
+                continue;
+            }
+
             // Serve each connection independently; one bad peer never blocks the others.
             _ = Task.Run(() => ServeClientAsync(client, ct), CancellationToken.None);
         }
@@ -85,8 +98,14 @@ internal sealed class ReplicationListener : IDisposable
 
             if (_options.Certificate is { } certificate)
             {
+                // The TLS handshake shares the pre-AUTH deadline: a peer that stalls it is closed too.
                 var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
-                await ssl.AuthenticateAsServerAsync(ReplicationTls.ServerOptions(_options, certificate), ct).ConfigureAwait(false);
+                using (var handshake = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    handshake.CancelAfter(ReplicationProtocol.PreAuthTimeout);
+                    await ssl.AuthenticateAsServerAsync(ReplicationTls.ServerOptions(_options, certificate), handshake.Token).ConfigureAwait(false);
+                }
+
                 stream = ssl;
             }
 
@@ -100,6 +119,7 @@ internal sealed class ReplicationListener : IDisposable
         finally
         {
             client.Dispose();
+            Interlocked.Decrement(ref _open);
         }
     }
 

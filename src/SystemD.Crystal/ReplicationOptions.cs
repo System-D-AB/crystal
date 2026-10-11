@@ -72,4 +72,10 @@ public sealed class ReplicationOptions
 
     /// <summary>The maximum bytes in one <c>PULL</c> reply (R3.2).</summary>
     public int PageBytes { get; init; } = 1 << 20;
+
+    /// <summary>
+    /// The most connections the listener keeps open at once (003 should-fix 8; default 64): standbys, their snapshot
+    /// downloads, and connections not yet authenticated. One more is closed as soon as it is accepted.
+    /// </summary>
+    public int MaxConnections { get; init; } = 64;
 }

@@ -24,6 +24,12 @@ internal enum ApplyStatus
 {
     Applied,
     EpochRefused,
+
+    /// <summary>
+    /// The page does not continue the database from its position (003 should-fix 7): a hole, a batch straddling the
+    /// position, or a malformed batch. Nothing was written; the database must be re-bootstrapped.
+    /// </summary>
+    NotContiguous,
 }
 
 /// <summary>What one page apply did (spec 003 R4).</summary>
@@ -85,18 +91,34 @@ internal sealed class BatchApplier
         var skipped = 0;
         var touchedCatalogue = false;
 
+        // RocksDB numbers a written batch from the standby's own next sequence, not from the batch's header, so the
+        // standby's positions match the primary's only if every batch it writes starts exactly where the last one
+        // ended (003 should-fix 7). A batch wholly at or below the watermark is a re-pull and skipped (R4.1); a batch
+        // straddling the watermark, or a fresh batch that does not start at the expected sequence, refuses the page
+        // whole, writing nothing.
+        var expected = watermark + 1;
         foreach (var (seq, data) in batches)
         {
-            // Skip a batch whose last sequence is at or below the watermark (a re-pull). A batch's last sequence is
-            // its first plus its count minus one; a batch straddling the watermark cannot occur, because the WAL
-            // reader trimmed the straddling first record (R3.6) and later batches start past it.
-            if (seq <= watermark)
+            if (data.Length < HeaderSize || BinaryPrimitives.ReadUInt64LittleEndian(data) != seq)
+            {
+                return NotContiguous();
+            }
+
+            var count = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(8));
+            var last = seq + Math.Max(count, 1u) - 1;
+            if (last <= watermark)
             {
                 skipped++;
                 continue;
             }
 
+            if (seq != expected)
+            {
+                return NotContiguous(); // a hole, or a batch straddling the watermark
+            }
+
             fresh.Add(data);
+            expected = seq + count;
         }
 
         if (fresh.Count == 0)
@@ -107,21 +129,24 @@ internal sealed class BatchApplier
         // R4.5 is decided here from the bytes, before the write, so the follower can reload the catalogue after.
         touchedCatalogue = fresh.Exists(TouchesCatalogue);
 
-        if (fresh.Count > 1 && TryConcat(fresh, out var page))
+        if (fresh.Count == 1)
         {
-            _target.ApplyRaw(page);
-            SyncedWrites++; // one synced write for the whole contiguous page (066 C2)
+            _target.ApplyRaw(fresh[0]);
+        }
+        else if (TryConcat(fresh, out var page))
+        {
+            _target.ApplyRaw(page); // one synced write for the whole contiguous page (066 C2)
         }
         else
         {
-            foreach (var batch in fresh)
-            {
-                _target.ApplyRaw(batch);
-                SyncedWrites++;
-            }
+            return NotContiguous();
         }
 
+        SyncedWrites++;
         return new ApplyResult(ApplyStatus.Applied, fresh.Count, skipped, touchedCatalogue, _target.Watermark);
+
+        ApplyResult NotContiguous() =>
+            new(ApplyStatus.NotContiguous, 0, skipped, TouchedCatalogue: false, _target.Watermark);
     }
 
     /// <summary>

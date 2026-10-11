@@ -152,9 +152,12 @@ while it waited answers `CRYSTAL_NOTPRIMARY`, so no reply is stamped with a hist
 
 ## 5. Applying, gaps, divergence
 
-- **Apply** (`BatchApplier` over `StandbyDatabase`): skip batches at or below the position; concatenate a contiguous
-  run into **one synced write per page** through the one commit point (`RocksInstance.Write`), so a crash keeps the
-  whole page or none; refuse a page below the seen epoch, writing nothing. If a page wrote box 0 the catalogue is
+- **Apply** (`BatchApplier` over `StandbyDatabase`): skip batches wholly at or below the position; the first new
+  batch must start right after it and each next where the last ended — RocksDB numbers a written batch from the
+  standby's own next sequence, so a hole or a batch straddling the position would misalign every position after it.
+  Such a page is refused whole, writing nothing, and the database re-bootstraps. A contiguous run is concatenated into
+  **one synced write per page** through the one commit point (`RocksInstance.Write`), so a crash keeps the whole page
+  or none; a page below the seen epoch is refused, writing nothing. If a page wrote box 0 the catalogue is
   reloaded (`DatabaseContext.LoadCatalogue`). After the write, `follow/{uid}.json` is recorded if it changed.
 - **A standby refuses every local write** while it follows a database (`DatabaseContext.FollowingPrimary` →
   `NotPrimaryException`); the applier's own writes go through `WalAccess.ApplyRaw`, which does not pass that path.
@@ -229,7 +232,9 @@ committed beyond any standby's acknowledgement, decoded per box.
 
 Requests are an array of bulk strings, the command first; numbers in requests are decimal text. One request at a time
 per connection; a reply always precedes the next request. **Caps:** before `AUTH` a frame may not exceed 4 KiB and the
-connection closes after 10 s without `AUTH`; after `AUTH` a request may not exceed 64 KiB. A declared length above a
+connection closes 10 s after it was accepted if it has not authenticated (one deadline, not restarted by each
+request; it covers the TLS handshake too); the listener keeps at most `MaxConnections` (64) connections open and closes
+one more as soon as it is accepted; after `AUTH` a request may not exceed 64 KiB. A declared length above a
 cap, or any malformed frame, closes the connection without an answer.
 
 ### 8.2 Commands
