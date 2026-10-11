@@ -221,6 +221,12 @@ per database, one connection per standby.**
   an idle connection is closed after 10 s.
 - **R10.6** **TLS is optional**, configured by certificate on the listener. When a client certificate is required, it
   is validated against the configured trust (Highway accepted any).
+  _Amended 2026-10-11 (maintainer approved the shared secret plus the TLS option as the design): as first built, only
+  the listener spoke TLS and the standby never did, so turning TLS on stopped replication, and no trust could be
+  configured. Now a node's certificate is used both ways (it serves TLS and follows over TLS, presenting it as its
+  client certificate); `TrustedCertificates` names the roots peers must chain to (the operating system's trust
+  without it); the standby checks the primary's certificate name against the host it connects to. Crystal does no
+  user authentication or authorization; replication's secret and TLS only prove the peer is a node of the cluster._
 - **R10.7** The protocol version is an integer stated in `HELLO`. A node refuses a peer whose version it does not
   speak, naming both versions. Version 1 is this spec.
 - **R10.8** Every frame has a size cap (after `AUTH`, the page size plus a margin); a declared length above it closes

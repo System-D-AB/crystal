@@ -581,3 +581,10 @@ reviews of the fixes found more, also fixed. Tests: `tests/SystemD.Crystal.Tests
   while it waited; a role or epoch change did not wake it; and one semaphore woke one waiter of several. Now: a change
   counter wakes every waiting pull on a commit, a set change, an epoch or a role change; a pull checks the role and
   epoch again before it answers. Tests (`PullWaitTests`, 3). Four mutations, each caught.
+- **R10.6, TLS both ways (2026-10-11).** Found while discussing authentication: the listener served TLS but the
+  standby never connected with it, and no trust was configurable. Now `Replication/ReplicationTls.cs` connects the
+  standby over TLS when the node has a certificate (also for snapshot downloads), presents that certificate for
+  mutual TLS, validates peers against the new `TrustedCertificates` or the operating system's trust, and checks the
+  primary's certificate name. Tests (`TlsTests`, 5, with a test CA issuing node certificates): replication over mutual
+  TLS end to end; refused when the standby does not trust the primary, when the primary does not trust the standby's
+  certificate, and when the standby has no TLS; a certificate for another host refused. Four mutations, each caught.

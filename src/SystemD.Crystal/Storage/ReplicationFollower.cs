@@ -170,9 +170,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
     private async Task ConnectAndPumpAsync(CancellationToken ct)
     {
         var (host, port) = ParseEndpoint(_primaryEndpoint);
-        using var tcp = new TcpClient { NoDelay = true };
-        await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
-        using var stream = tcp.GetStream();
+        await using var stream = await ReplicationTls.ConnectAsync(host, port, _options, ct).ConfigureAwait(false);
 
         var client = new ReplicationClient(stream, _nodeId, _options.Secret);
         await client.HandshakeAsync(ReplicationProtocol.RoleStandby, _epoch.Epoch, ct).ConfigureAwait(false);
@@ -421,9 +419,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
     {
         // Its own connection (design § 7): a snapshot download must not block the pull loop's connection.
         var (host, port) = ParseEndpoint(_primaryEndpoint);
-        using var tcp = new TcpClient { NoDelay = true };
-        tcp.Connect(host, port);
-        using var stream = tcp.GetStream();
+        using var stream = ReplicationTls.ConnectAsync(host, port, _options, _cts.Token).GetAwaiter().GetResult();
         var client = new ReplicationClient(stream, _nodeId, _options.Secret);
         client.HandshakeAsync(ReplicationProtocol.RoleStandby, _epoch.Epoch, _cts.Token).GetAwaiter().GetResult();
         return SnapshotBootstrap.DownloadAsync(client, uid, bootstrapDir, _cts.Token).GetAwaiter().GetResult();

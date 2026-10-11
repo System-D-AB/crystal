@@ -248,6 +248,13 @@ cap, or any malformed frame, closes the connection without an answer.
 - `role` is `primary`, `standby` or `fenced`; `format` is `crystal 1`; `layout` is `default,general,delete_heavy`.
 - `nonce` is 32 random bytes, hex; `hmacHex = hex(HMAC-SHA256(secret, nonce ‖ requesterNodeId))`. The secret never
   crosses the wire; a nonce is valid for one `AUTH` on its connection only.
+- **TLS is optional, and both ways when on.** A node given a `Certificate` serves TLS on its listener and connects to
+  its primary over TLS, presenting the same certificate when the primary requires one (`RequireClientCertificate`,
+  mutual TLS). Every node of a cluster has a certificate or none, since a standby listens too. A peer's certificate
+  must chain to `TrustedCertificates` (an internal CA's root, revocation not checked) or, without it, to the operating
+  system's trust; the primary's certificate must also carry the host name or address the standby connects to. The
+  shared-secret challenge runs inside TLS either way. Crystal does no user authentication or authorization: that is
+  the product's; this only proves that the other end is a node of the same cluster.
 - **Authentication goes both ways.** `AUTH` carries the requester's own 32-byte nonce, and the server answers with its
   proof over it. A standby refuses a primary whose proof is missing or wrong before it takes a page, an epoch or a
   snapshot from it: anyone who can answer at the endpoint otherwise could feed it data.

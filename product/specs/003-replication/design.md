@@ -235,6 +235,7 @@ public sealed class ReplicationOptions
     public required string Secret { get; init; }          // never logged
     public X509Certificate2? Certificate { get; init; }   // TLS on the listener
     public bool RequireClientCertificate { get; init; }
+    public X509Certificate2Collection? TrustedCertificates { get; init; } // amended 2026-10-11 (R10.6)
     public long LagCap { get; init; } = 100_000;          // sequences, per slot
     public TimeSpan SlotStaleAfter { get; init; } = TimeSpan.FromSeconds(60);
     public long TailBytesPerDatabase { get; init; } = 16L << 20;

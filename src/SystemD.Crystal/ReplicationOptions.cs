@@ -20,11 +20,25 @@ public sealed class ReplicationOptions
     /// <summary>The store's shared replication secret, used by the HMAC challenge (R10.5). Never logged.</summary>
     public required string Secret { get; init; }
 
-    /// <summary>An optional TLS certificate for the listener (R10.6).</summary>
+    /// <summary>
+    /// This node's TLS certificate, with its private key (R10.6). When set, the node serves TLS on its listener and
+    /// connects to its primary over TLS, presenting this certificate when the primary requires a client certificate.
+    /// Every node of a cluster has one or none: a standby listens too, to be promotable. The shared-secret challenge runs
+    /// inside TLS either way. Its subject or alternative names must include the host name or address peers connect to.
+    /// </summary>
     public X509Certificate2? Certificate { get; init; }
 
-    /// <summary>Whether a connecting client must present a certificate validated against the configured trust (R10.6).</summary>
+    /// <summary>
+    /// Whether a connecting node must present a certificate, validated against <see cref="TrustedCertificates"/> or the
+    /// operating system's trust (R10.6; mutual TLS). Only with a <see cref="Certificate"/>.
+    /// </summary>
     public bool RequireClientCertificate { get; init; }
+
+    /// <summary>
+    /// The certificates a peer's certificate must chain to (R10.6): an internal CA's root, or the nodes' self-signed
+    /// certificates. Null uses the operating system's trust store. Revocation is not checked against these.
+    /// </summary>
+    public X509Certificate2Collection? TrustedCertificates { get; init; }
 
     /// <summary>A slot's lag cap in sequences (R2.3); past it a standby is dropped.</summary>
     public long LagCap { get; init; } = 100_000;

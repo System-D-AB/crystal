@@ -86,13 +86,7 @@ internal sealed class ReplicationListener : IDisposable
             if (_options.Certificate is { } certificate)
             {
                 var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
-                var sslOptions = new SslServerAuthenticationOptions
-                {
-                    ServerCertificate = certificate,
-                    ClientCertificateRequired = _options.RequireClientCertificate,
-                    RemoteCertificateValidationCallback = ValidateClientCertificate,
-                };
-                await ssl.AuthenticateAsServerAsync(sslOptions, ct).ConfigureAwait(false);
+                await ssl.AuthenticateAsServerAsync(ReplicationTls.ServerOptions(_options, certificate), ct).ConfigureAwait(false);
                 stream = ssl;
             }
 
@@ -107,19 +101,6 @@ internal sealed class ReplicationListener : IDisposable
         {
             client.Dispose();
         }
-    }
-
-    private bool ValidateClientCertificate(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors errors)
-    {
-        // When a client certificate is required, it is validated against the configured trust (R10.6): Highway
-        // accepted any; Crystal requires a chain with no policy errors. When not required, no client certificate is
-        // requested, so this is only reached in the required case.
-        if (!_options.RequireClientCertificate)
-        {
-            return true;
-        }
-
-        return certificate is not null && errors == SslPolicyErrors.None;
     }
 
     private static IPEndPoint ParseEndpoint(string endpoint)
