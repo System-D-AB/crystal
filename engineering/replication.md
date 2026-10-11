@@ -116,8 +116,9 @@ src/SystemD.Crystal/
 
   A store opened without replication options continues a record that exists (its databases take writes), but starts
   none. A standby's databases and databases the store does not replicate keep an in-memory history nothing serves. A
-  standby keeps the incarnation it last applied from in `follow/{uid}.json`, updated on every accepted page, and
-  compares it to detect divergence. Serving a database, and taking its snapshot, enter it like any call, so a drop or
+  standby keeps the incarnation it last applied from in `follow/{uid}.json`, written when an accepted page changes
+  it, and compares it to detect divergence; the record is read once when a database starts to be followed and then
+  kept in memory, since nothing else writes it meanwhile. Serving a database, and taking its snapshot, enter it like any call, so a drop or
   close waits for them; its WAL readers are released while it closes, before its instance goes.
 
 ## 4. A pull
@@ -208,15 +209,17 @@ or fencing ends it.
 The epoch and the role are node-local, in `node.epoch` (`"{epoch} {role}"`, role `primary` or `standby`), written
 atomically. A node with no file starts as a primary at epoch 1. **Only a primary accepts local writes to replicated
 databases:** a standby, demoted or fenced node refuses them with `NotPrimaryException` (a database the store does not
-replicate is always writable). The role survives a restart: a demoted node, or a standby, comes back a standby; a
+replicate is always writable). A local write, and a change to the set of replicated databases, is admitted by the
+role and counted until it ends; standing down (a demotion, a fence, a higher epoch) waits for the writes already
+admitted, so once it returns nothing local lands after it. The role survives a restart: a demoted node, or a standby, comes back a standby; a
 fenced node comes back a standby too, since a restart ends the fence but never makes a node that stood down a primary
 again. **Promotion** stops following, gives every open database a new incarnation at what the node received, then
 increments the epoch and persists it with the role **before** the node accepts writes or serves (a persist failure
-fails the promotion), and clears the tails, readers and slots. A node adopts a **higher epoch** stated by an
+fails the promotion with an `IOException`: epoch and role unchanged, no longer following), and clears the tails, readers and slots. A node adopts a **higher epoch** stated by an
 authenticated peer only, after `AUTH` (a primary or fenced node demotes to standby); an epoch above 2^62 is refused.
 **Two primaries at the same epoch** are reported as a conflict event with both node ids, and Crystal applies neither
-into the other. **Fence** makes a node read-only at once. **Demote** writes a reconciliation report of what it
-committed beyond any standby's acknowledgement, decoded per box.
+into the other. **Fence** makes a node read-only at once. **Demote** stands down, then writes a reconciliation report of what
+it committed beyond any standby's acknowledgement, decoded per box.
 
 ## 8. The wire protocol, version 1 (the inspection reference)
 

@@ -24,6 +24,11 @@ internal sealed class StandbyDatabase
     private readonly BatchApplier _applier;
     private readonly ApplyTarget _target;
 
+    // The follow record, read from disk once and then kept as this object writes it (003 review): every pull checks it,
+    // and while this database is followed nothing else writes it (a bootstrap writes it, then follows anew).
+    private FollowRecord? _followRecord;
+    private bool _followRecordLoaded;
+
     public StandbyDatabase(DatabaseSlot slot, string uid, string dataDirectory, long initialEpoch = 0)
     {
         _slot = slot ?? throw new ArgumentNullException(nameof(slot));
@@ -83,12 +88,13 @@ internal sealed class StandbyDatabase
         // follows current, so the primary's history of earlier incarnations need not reach back to it.
         if (Guid.TryParse(servedIncarnation, out var incarnation))
         {
-            var current = FollowRecord.Read(_dataDirectory, _uid);
+            var current = KeptFollowRecord();
             if (current is null
                 || !string.Equals(current.Incarnation, incarnation.ToString("D"), StringComparison.Ordinal)
                 || current.Base != servedBase)
             {
                 FollowRecord.Write(_dataDirectory, _uid, incarnation, servedBase, servedHistory);
+                _followRecord = FollowRecord.Read(_dataDirectory, _uid);
             }
         }
 
@@ -105,7 +111,7 @@ internal sealed class StandbyDatabase
     /// </summary>
     public bool HasDiverged(string servedIncarnation, long servedBase, IReadOnlyList<IncarnationEnd>? history = null)
     {
-        var kept = FollowRecord.Read(_dataDirectory, _uid);
+        var kept = KeptFollowRecord();
         var sameIncarnation = kept is not null
             && string.Equals(kept.Incarnation, servedIncarnation, StringComparison.Ordinal);
         if (sameIncarnation)
@@ -149,6 +155,18 @@ internal sealed class StandbyDatabase
                 yield return (e.Id, e.End);
             }
         }
+    }
+
+    /// <summary>The follow record of this database: read from disk on first use, then as this object last wrote it.</summary>
+    private FollowRecord? KeptFollowRecord()
+    {
+        if (!_followRecordLoaded)
+        {
+            _followRecord = FollowRecord.Read(_dataDirectory, _uid);
+            _followRecordLoaded = true;
+        }
+
+        return _followRecord;
     }
 
     /// <summary>Stops following (promotion, T12): the database accepts local writes again.</summary>

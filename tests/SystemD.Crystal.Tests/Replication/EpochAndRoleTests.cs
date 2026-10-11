@@ -39,6 +39,33 @@ public sealed class EpochAndRoleTests
     }
 
     [Fact]
+    public void Promote_WhenTheEpochCannotBeWritten_ThrowsIOException_AndLeavesTheNodeAsItWas()
+    {
+        using var dir = new TempStoreDirectory();
+        using var store = CrystalStore.Open(dir.Path, Options());
+        store.Replication.Demote();
+        var epoch = store.Replication.Epoch;
+        var events = new List<ReplicationEvent>();
+        store.Replication.Events += (_, e) => events.Add(e);
+
+        // Hold the epoch's temporary file open, so writing the new epoch fails.
+        var path = System.IO.Directory.GetFiles(dir.Path, ReplicationEpoch.FileName, System.IO.SearchOption.AllDirectories)[0];
+        using (new System.IO.FileStream(path + ".tmp", System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.None))
+        {
+            var ex = Assert.Throws<System.IO.IOException>(() => store.Replication.Promote("test"));
+            Assert.Contains("promote again", ex.Message, StringComparison.Ordinal);
+            Assert.NotNull(ex.InnerException);
+        }
+
+        Assert.Equal(epoch, store.Replication.Epoch);
+        Assert.Equal(ReplicationRole.Standby, store.Replication.Role);
+        Assert.DoesNotContain(events, e => e.Kind == ReplicationEventKind.Promoted);
+
+        // With the disk fixed, promotion succeeds.
+        Assert.Equal(epoch + 1, store.Replication.Promote("test"));
+    }
+
+    [Fact]
     public void TheEpoch_IsKeptAcrossReopen()
     {
         using var dir = new TempStoreDirectory();

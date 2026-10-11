@@ -171,11 +171,14 @@ public sealed class CrystalReplication : IDisposable
     }
 
     /// <summary>
-    /// Promotes this node to primary (spec 003 R6.1, R6.2): persist the new epoch **before** serving (a persist
-    /// failure fails the promotion and leaves the node as it was), stop following, take the primary role, give every
-    /// open database a new incarnation so a standby past the old base diverges (R5.2), and raise a Promoted event.
-    /// Returns the new epoch.
+    /// Promotes this node to primary (spec 003 R6.1, R6.2): stop following, persist the new epoch **before** serving,
+    /// take the primary role, give every open database a new incarnation so a standby past the old base diverges
+    /// (R5.2), and raise a Promoted event. Returns the new epoch.
     /// </summary>
+    /// <exception cref="System.IO.IOException">
+    /// The new epoch could not be written to <c>node.epoch</c>. The node did not become a primary: its epoch and role
+    /// are unchanged, but it no longer follows. Fix the disk and promote again, or follow a primary.
+    /// </exception>
     public long Promote(string reason)
     {
         lock (_gate)
@@ -197,11 +200,15 @@ public sealed class CrystalReplication : IDisposable
             // A new incarnation per open database at promotion (R5.2), and the epoch and role (which open writes) in the
             // same step under the store gate, so no database opens in between without a history.
             var newEpoch = 0L;
-            if (!_engine.BeginNewIncarnations(() => _epoch.TryPromote(Storage.ReplicationRole.Primary, out newEpoch)))
+            System.IO.IOException? failure = null;
+            if (!_engine.BeginNewIncarnations(() => _epoch.TryPromote(Storage.ReplicationRole.Primary, out newEpoch, out failure)))
             {
-                throw new InvalidOperationException(
-                    "Promotion failed: the new epoch could not be persisted to node.epoch (R6.2). The node did not " +
-                    "become a primary; check the disk and retry.");
+                // A typed error a failover controller must handle (playbook § 7): the disk, not the caller, is at fault.
+                throw new System.IO.IOException(
+                    "Promotion failed: the new epoch could not be written to node.epoch (R6.2), so the node did not " +
+                    "become a primary; its epoch and role are unchanged, but it no longer follows. Fix the disk and " +
+                    "promote again, or follow a primary. Cause: " + failure?.Message,
+                    failure);
             }
 
             Raise(new ReplicationEvent(ReplicationEventKind.Promoted, newEpoch, $"promoted: {reason}"));
@@ -224,9 +231,11 @@ public sealed class CrystalReplication : IDisposable
                 return;
             }
 
-            // R9.2: before standing down, record what this node committed beyond any standby's acknowledgement.
-            var report = _source?.WriteReconciliationReport();
+            // Stand down first: shutting the write gate waits for the local writes already admitted, so the report
+            // below holds every write this node committed (003 review, race windows). Then, R9.2: record what this
+            // node committed beyond any standby's acknowledgement.
             _epoch.SetRole(Storage.ReplicationRole.Standby);
+            var report = _source?.WriteReconciliationReport();
             _source?.ClearAllHistory();
             LastReconciliationReport = report;
             Raise(new ReplicationEvent(ReplicationEventKind.Demoted, _epoch.Epoch,

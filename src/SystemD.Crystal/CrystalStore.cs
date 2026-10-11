@@ -125,7 +125,8 @@ public sealed class CrystalStore : IDisposable
         ThrowIfDisposed();
         if (replicated)
         {
-            ThrowIfNotPrimary(_engine.WriteGate, $"create replicated database '{name}'");
+            using var admitted = AdmitIfPrimary(_engine.WriteGate, $"create replicated database '{name}'");
+            return _engine.CreateDatabase(this, name, replicated);
         }
 
         return _engine.CreateDatabase(this, name, replicated);
@@ -212,7 +213,7 @@ public sealed class CrystalStore : IDisposable
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(database);
-        ThrowIfNotPrimary(database.Slot.Context.WriteGate, $"rename replicated database '{database.Name}'");
+        using var admitted = AdmitIfPrimary(database.Slot.Context.WriteGate, $"rename replicated database '{database.Name}'");
         _engine.RenameDatabase(database, newName);
     }
 
@@ -224,8 +225,8 @@ public sealed class CrystalStore : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(first);
         ArgumentNullException.ThrowIfNull(second);
-        ThrowIfNotPrimary(first.Slot.Context.WriteGate, $"swap replicated database '{first.Name}'");
-        ThrowIfNotPrimary(second.Slot.Context.WriteGate, $"swap replicated database '{second.Name}'");
+        using var firstAdmitted = AdmitIfPrimary(first.Slot.Context.WriteGate, $"swap replicated database '{first.Name}'");
+        using var secondAdmitted = AdmitIfPrimary(second.Slot.Context.WriteGate, $"swap replicated database '{second.Name}'");
         _engine.SwapDatabases(first, second);
     }
 
@@ -238,22 +239,26 @@ public sealed class CrystalStore : IDisposable
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(database);
-        ThrowIfNotPrimary(database.Slot.Context.WriteGate, $"drop replicated database '{database.Name}'");
+        using var admitted = AdmitIfPrimary(database.Slot.Context.WriteGate, $"drop replicated database '{database.Name}'");
         _engine.DropDatabase(database);
     }
 
     /// <summary>
     /// The set of replicated databases is the primary's (spec 003 R1.4, R1.6; addendum 2026-10-10 review): a standby,
-    /// demoted or fenced node refuses to change it. Replication's own reconcile changes it through the engine.
+    /// demoted or fenced node refuses to change it. Replication's own reconcile changes it through the engine. The
+    /// change holds the returned admission until it ends, so a demotion or fence waits for it.
     /// </summary>
-    private static void ThrowIfNotPrimary(Storage.ReplicationWriteGate? gate, string operation)
+    private static Storage.ReplicationWriteGate.Admission AdmitIfPrimary(Storage.ReplicationWriteGate? gate, string operation)
     {
-        if (gate?.RefusedAs is { } role)
+        var admitted = Storage.ReplicationWriteGate.Admit(gate, out var refusedAs);
+        if (refusedAs is { } role)
         {
             throw new NotPrimaryException(
                 $"Cannot {operation}: this node is a {role}, not the primary, and the set of replicated databases is the " +
                 "primary's (R1.4, R1.6). Do it on the primary, or promote this node.");
         }
+
+        return admitted;
     }
 
     private void ThrowIfDisposed()

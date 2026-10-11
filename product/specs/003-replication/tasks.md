@@ -600,3 +600,22 @@ reviews of the fixes found more, also fixed. Tests: `tests/SystemD.Crystal.Tests
   no cap. Now one deadline counts from the connection (and bounds the TLS handshake), and the listener keeps at most
   `MaxConnections` (new option, default 64). Tests (`ReplicationProtocolTests` 1, `ConnectionLimitTests` 1). Two
   mutations, each caught.
+- **Smaller items of the 2026-10-10 review (2026-10-11).**
+  - *Binding surface:* the standby applies raw batches through `WriteBatch(byte[], long)` and the primary reads them
+    with `ToBytes`; both are now checked (`BindingSurfaceTests`).
+  - *Typed promotion failure:* a promotion whose epoch cannot be written threw `InvalidOperationException`; it now
+    throws `IOException` with the cause and the way forward (fix the disk and promote again, or follow). "Replication
+    not configured" stays `InvalidOperationException`: a usage error, not one a caller handles. Test
+    (`EpochAndRoleTests` 1).
+  - *Race windows:* a write that passed the role check could still land after `Fence` or `Demote` returned, and the
+    store-level create, rename, swap and drop checked the role outside any lock. Now the write gate admits each local
+    write and set change and counts it until it ends; shutting the gate waits for those admitted. `Demote` stands down
+    before writing its reconciliation report, so the report holds every local write. Promoting a node that is already
+    primary takes each base while writes are open: analysed as safe (a base only needs to be at or below what the old
+    history holds, and it is the latest at that moment). Test (`ReplicationBlockerTests` 1). Not covered by a test:
+    the order inside `Admit` (count, then read the role) and the store-level admissions; both are interleavings no
+    hook reaches.
+  - *Follow record:* read from disk on every pull for every database; now read once per followed database and kept as
+    `Apply` writes it. Test (`DivergenceAndGapTests` 1; the design-table test starts a new follow after deleting the
+    record).
+  - Five mutations, each caught.

@@ -584,9 +584,10 @@ internal sealed class DatabaseContext : IDisposable
 
     /// <summary>
     /// Refuses a local write while this database follows a primary (spec 003 R1.6, design § 5), or while it is
-    /// replicated and this node is not the primary: a standby, demoted or fenced node (R6.5, 003 addendum B2).
+    /// replicated and this node is not the primary: a standby, demoted or fenced node (R6.5, 003 addendum B2). An
+    /// admitted write holds the returned admission until it ends, so a demotion or fence waits for it.
     /// </summary>
-    private void ThrowIfFollowing()
+    private ReplicationWriteGate.Admission AdmitLocalWrite()
     {
         if (_followingPrimary)
         {
@@ -595,12 +596,15 @@ internal sealed class DatabaseContext : IDisposable
                 "only from the primary, through replication. Promote this node to accept writes here.");
         }
 
-        if (WriteGate?.RefusedAs is { } role)
+        var admitted = ReplicationWriteGate.Admit(WriteGate, out var refusedAs);
+        if (refusedAs is { } role)
         {
             throw new NotPrimaryException(
                 $"{_label} is replicated and this node is a {role}, not the primary; it refuses local writes (R1.6, " +
                 "R6.5). Write on the primary, or promote this node to accept writes here.");
         }
+
+        return admitted;
     }
 
     /// <summary>
@@ -728,7 +732,7 @@ internal sealed class DatabaseContext : IDisposable
         try
         {
             ThrowIfUnusable();
-            ThrowIfFollowing();
+            using var admitted = AdmitLocalWrite();
 
             if (_aliases.ContainsKey(name))
             {
@@ -831,7 +835,7 @@ internal sealed class DatabaseContext : IDisposable
         try
         {
             ThrowIfUnusable();
-            ThrowIfFollowing();
+            using var admitted = AdmitLocalWrite();
 
             if (!_records.TryGetValue(box.Id, out var record) || record.State != LiveState)
             {
@@ -887,7 +891,7 @@ internal sealed class DatabaseContext : IDisposable
         try
         {
             ThrowIfUnusable();
-            ThrowIfFollowing();
+            using var admitted = AdmitLocalWrite();
 
             if (first.Id == second.Id)
             {
@@ -951,7 +955,7 @@ internal sealed class DatabaseContext : IDisposable
                 throw new BoxNotFoundException(box.Id, $"Box '{box.Name}' (id {box.Id}) is not live (R3.4).");
             }
 
-            ThrowIfFollowing();
+            using var admitted = AdmitLocalWrite();
 
             var dropped = record with
             {
@@ -1065,7 +1069,7 @@ internal sealed class DatabaseContext : IDisposable
             return; // R6.3: empty batch writes nothing and syncs nothing
         }
 
-        ThrowIfFollowing(); // R1.6: a standby refuses local writes before any work
+        using var admitted = AdmitLocalWrite(); // R1.6: a standby refuses local writes before any work
 
         long? start = _metrics is { TimesCommits: true } || _slowCommitThreshold is not null ? _clock.GetTimestamp() : null;
         var outcome = "refused";

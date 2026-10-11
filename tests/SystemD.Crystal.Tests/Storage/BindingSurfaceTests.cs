@@ -61,6 +61,7 @@ public sealed class BindingSurfaceTests
         ("RocksDbSharp.WriteBatch", "Put"),
         ("RocksDbSharp.WriteBatch", "Delete"),
         ("RocksDbSharp.WriteBatch", "DeleteRange"),
+        ("RocksDbSharp.WriteBatch", "ToBytes"),
         ("RocksDbSharp.WriteOptions", "SetSync"),
         ("RocksDbSharp.ReadOptions", "SetIterateLowerBound"),
         ("RocksDbSharp.ReadOptions", "SetIterateUpperBound"),
@@ -109,6 +110,14 @@ public sealed class BindingSurfaceTests
             .ToList();
 
         Assert.True(missing.Count == 0, "Missing managed members on the RocksDB binding:\n  " + string.Join("\n  ", missing));
+    }
+
+    [Fact]
+    public void WriteBatchFromBytes_IsPresent()
+    {
+        // A standby applies the primary's raw batches through this constructor (spec 003, WalAccess.ApplyRaw).
+        var type = Binding.GetType("RocksDbSharp.WriteBatch");
+        Assert.NotNull(type?.GetConstructor([typeof(byte[]), typeof(long)]));
     }
 
     [Fact]

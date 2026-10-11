@@ -170,11 +170,13 @@ internal sealed class ReplicationEpoch
 
     /// <summary>
     /// Promotes to <paramref name="role"/> at <c>current epoch + 1</c>, persisting the new epoch **before** memory is
-    /// updated (R6.2): a failure to persist leaves epoch and role unchanged and returns false, so the node never
-    /// serves as a primary at an epoch the disk does not hold. On success the new epoch is <paramref name="newEpoch"/>.
+    /// updated (R6.2): a failure to persist leaves epoch and role unchanged and returns false with the cause in
+    /// <paramref name="failure"/>, so the node never serves as a primary at an epoch the disk does not hold. On success
+    /// the new epoch is <paramref name="newEpoch"/>.
     /// </summary>
-    public bool TryPromote(ReplicationRole role, out long newEpoch)
+    public bool TryPromote(ReplicationRole role, out long newEpoch, out IOException? failure)
     {
+        failure = null;
         lock (_gate)
         {
             var target = Interlocked.Read(ref _epoch) + 1;
@@ -182,9 +184,16 @@ internal sealed class ReplicationEpoch
             {
                 Persist(target, role); // persist first (R6.2)
             }
-            catch (IOException)
+            catch (IOException ex)
             {
                 newEpoch = Interlocked.Read(ref _epoch);
+                failure = ex;
+                return false;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                newEpoch = Interlocked.Read(ref _epoch);
+                failure = new IOException(ex.Message, ex);
                 return false;
             }
 

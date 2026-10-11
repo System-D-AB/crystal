@@ -73,9 +73,32 @@ public sealed class DivergenceAndGapTests
         Assert.True(standby.HasDiverged(other, servedBase: position + 5));
 
         // A missing kept record compares as unknown (R5.5): diverged, so a crash before the record is written costs at
-        // most a needless re-bootstrap.
+        // most a needless re-bootstrap. The record is read when following starts (then kept in memory), so a new follow.
         FollowRecord.Delete(dir.Path, db.Uid);
-        Assert.True(standby.HasDiverged(inc, servedBase: position + 5));
+        var restarted = new StandbyDatabase(db.Slot, db.Uid, dir.Path);
+        Assert.True(restarted.HasDiverged(inc, servedBase: position + 5));
+    }
+
+    [Fact]
+    public void TheFollowRecord_IsKeptAsApplyWroteIt_NotReadAgainOnEveryPull()
+    {
+        using var dir = new TempStoreDirectory();
+        using var store = CrystalStore.Open(dir.Path, Options(listen: null));
+        var db = store.CreateDatabase("db", replicated: true);
+        var box = db.Boxes.Create("box");
+        Write(db, box, "k", "v");
+
+        // A page from a new incarnation (nothing new in it) records what this standby follows.
+        var standby = new StandbyDatabase(db.Slot, db.Uid, dir.Path);
+        var inc = Guid.NewGuid().ToString("D");
+        var result = standby.Apply(epoch: 1, Array.Empty<(ulong, byte[])>(), inc, servedBase: 0);
+        Assert.Equal(SystemD.Crystal.Replication.ApplyStatus.Applied, result.Status);
+        Assert.NotNull(FollowRecord.Read(dir.Path, db.Uid));
+        Assert.False(standby.HasDiverged(inc, servedBase: 0));
+
+        // The disk is not read again while the database is followed: nothing else writes the record meanwhile.
+        FollowRecord.Delete(dir.Path, db.Uid);
+        Assert.False(standby.HasDiverged(inc, servedBase: 0));
     }
 
     [Fact]

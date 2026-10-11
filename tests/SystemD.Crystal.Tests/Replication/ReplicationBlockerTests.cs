@@ -110,6 +110,41 @@ public sealed class ReplicationBlockerTests
     }
 
     [Fact]
+    public async Task B2_AFence_WaitsForAWriteAlreadyAdmitted_AndRefusesTheNext()
+    {
+        using var dir = new TempStoreDirectory();
+        using var store = CrystalStore.Open(dir.Path, Options());
+        var db = store.CreateDatabase("db", replicated: true);
+        var box = db.Boxes.Create("box");
+
+        // A write passes the role check, then pauses inside its commit; the fence starts meanwhile.
+        using var inside = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        db.Slot.Context.OnCommitInsideGate = () =>
+        {
+            inside.Set();
+            release.Wait(TimeSpan.FromSeconds(10));
+        };
+        var write = Task.Run(() => Put(db, box, "during", "1"));
+        Assert.True(inside.Wait(TimeSpan.FromSeconds(10)));
+        var fence = Task.Run(() => store.Replication.Fence("test"));
+
+        // The fence does not return while the admitted write is still writing.
+        await Task.Delay(300);
+        Assert.False(fence.IsCompleted);
+
+        db.Slot.Context.OnCommitInsideGate = null;
+        release.Set();
+        await write;
+        await fence.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Throws<NotPrimaryException>(() => Put(db, box, "after", "2"));
+        using var snapshot = db.Snapshot();
+        Assert.Equal("1"u8.ToArray(), snapshot.Get(box, "during"u8));
+        Assert.Equal(0, store.Engine.WriteGate.InFlight);
+    }
+
+    [Fact]
     public void B2_ADemotedNode_RefusesWrites_AndAPromotionAllowsThemAgain()
     {
         using var dir = new TempStoreDirectory();
