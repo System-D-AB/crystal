@@ -149,7 +149,7 @@ internal static class RespReader
         consumed = buffer.Start;
         error = null;
         var reader = new SequenceReader<byte>(buffer);
-        var status = TryReadValue(ref reader, maxFrameBytes, out value, out error);
+        var status = TryReadValue(ref reader, maxFrameBytes, depth: 0, out value, out error);
         if (status == RespReadStatus.Complete)
         {
             consumed = reader.Position;
@@ -158,11 +158,30 @@ internal static class RespReader
         return status;
     }
 
+    /// <summary>
+    /// The deepest nesting of arrays a reply may have. Crystal's replies nest at most five deep (a PULL reply's entry's
+    /// batches); a deeper reply is refused rather than followed down the stack (003 should-fix 4: a peer sending
+    /// <c>*1</c> a million times would otherwise overflow the stack and end the process).
+    /// </summary>
+    public const int MaxDepth = 16;
+
+    /// <summary>
+    /// Array elements reserved up front at most; more grow as they arrive. A declared count is a peer's claim, so it never
+    /// sizes an allocation on its own (003 should-fix 4).
+    /// </summary>
+    private const int MaxReservedElements = 1024;
+
     private static RespReadStatus TryReadValue(
-        ref SequenceReader<byte> reader, int maxFrameBytes, out RespValue? value, out string? error)
+        ref SequenceReader<byte> reader, int maxFrameBytes, int depth, out RespValue? value, out string? error)
     {
         value = null;
         error = null;
+        if (depth > MaxDepth)
+        {
+            error = $"RESP reply nests deeper than {MaxDepth} arrays";
+            return RespReadStatus.ProtocolError;
+        }
+
         if (!reader.TryPeek(out var prefix))
         {
             return RespReadStatus.Incomplete;
@@ -217,16 +236,24 @@ internal static class RespReader
                     return RespReadStatus.Complete;
                 }
 
-                var items = new RespValue[count];
+                // Every element takes at least three bytes (a type byte and CRLF), so a count larger than a third of the
+                // frame cap cannot be honest.
+                if (count > maxFrameBytes / 3)
+                {
+                    error = $"RESP array of {count} elements cannot fit in a {maxFrameBytes}-byte frame";
+                    return RespReadStatus.ProtocolError;
+                }
+
+                var items = new List<RespValue>((int)Math.Min(count, MaxReservedElements));
                 for (var i = 0; i < count; i++)
                 {
-                    var itemStatus = TryReadValue(ref reader, maxFrameBytes, out var item, out error);
+                    var itemStatus = TryReadValue(ref reader, maxFrameBytes, depth + 1, out var item, out error);
                     if (itemStatus != RespReadStatus.Complete)
                     {
                         return itemStatus;
                     }
 
-                    items[i] = item!;
+                    items.Add(item!);
                 }
 
                 value = RespValue.OfArray(items);

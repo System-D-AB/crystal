@@ -188,10 +188,26 @@ internal sealed class ReplicationConnection
             return false;
         }
 
-        if (request.Count != 2)
+        if (request.Count != 3)
         {
-            await WriteAsync(new RespWriter().Error($"{ReplicationProtocol.ErrArg} AUTH takes 1 argument"), ct).ConfigureAwait(false);
-            return true;
+            await WriteAsync(new RespWriter().Error($"{ReplicationProtocol.ErrArg} AUTH takes the response and the peer's own nonce"), ct).ConfigureAwait(false);
+            return false;
+        }
+
+        byte[] peerNonce;
+        try
+        {
+            peerNonce = Convert.FromHexString(Text.ASCII.GetString(request[2]));
+        }
+        catch (FormatException)
+        {
+            peerNonce = [];
+        }
+
+        if (peerNonce.Length != ReplicationProtocol.NonceBytes)
+        {
+            await WriteAsync(new RespWriter().Error($"{ReplicationProtocol.ErrArg} AUTH nonce must be {ReplicationProtocol.NonceBytes} bytes, hex"), ct).ConfigureAwait(false);
+            return false;
         }
 
         var expected = ReplicationProtocol.Response(_source.Secret, _nonce, _peerNodeId);
@@ -218,7 +234,8 @@ internal sealed class ReplicationConnection
         // report an equal-epoch conflict with another primary.
         _source.ObservePeer(_peerEpoch, _peerRole, _peerNodeId);
 
-        await WriteAsync(new RespWriter().SimpleString("OK"), ct).ConfigureAwait(false);
+        // This node's proof in turn: the peer authenticates it too.
+        await WriteAsync(new RespWriter().BulkString(Text.ASCII.GetBytes(ReplicationProtocol.Proof(_source.Secret, peerNonce, _source.NodeId))), ct).ConfigureAwait(false);
         return true;
     }
 

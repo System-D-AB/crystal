@@ -101,6 +101,14 @@ internal static class ReplicationProtocol
     }
 
     /// <summary>Constant-time comparison of two HMAC hex responses (R10.5); false on any length or content difference.</summary>
+    /// <summary>
+    /// The primary's proof that it holds the secret too (003 should-fix 4: the standby used to trust any endpoint that
+    /// answered): <c>HMAC-SHA256(secret, standbyNonce ‖ primaryNodeId)</c>, sent in reply to an <c>AUTH</c> that carries
+    /// the standby's own nonce.
+    /// </summary>
+    public static string Proof(string secret, byte[] standbyNonce, string primaryNodeId) =>
+        Response(secret, standbyNonce, primaryNodeId);
+
     public static bool ResponsesEqual(string expected, string actual)
     {
         if (expected is null || actual is null)

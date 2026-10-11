@@ -160,6 +160,9 @@ and closed; Crystal closes without answering, as the peer cannot be trusted to r
 |---|---|---|
 | `HELLO` | `HELLO <protocolVersion> <nodeId> <role> <epoch> <format> <layout>` | `[protocolVersion, nodeId, role, epoch, format, nonce]` |
 | `AUTH` | `AUTH <hmacHex>` | `+OK` |
+
+_(Amended 2026-10-11: `AUTH <hmacHex> <ownNonceHex>`, answered with the server's proof over the requester's nonce, so
+authentication goes both ways; see `engineering/replication.md` § 8.2.)_
 | `DATABASES` | `DATABASES` | `[setVersion, [[uid, name, latest]…]]` |
 | `PULL` | `PULL <maxBytes> <waitMs> (<uid> <from>)…` | `[epoch, setVersion, [entry…]]` |
 | `SNAPSHOT` | as § 7 | as § 7 |

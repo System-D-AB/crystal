@@ -97,6 +97,32 @@ public sealed class ReplicationProtocolTests
     }
 
     [Fact]
+    public async Task APeerThatCannotProveItHoldsTheSecret_IsRefusedByTheStandby()
+    {
+        // A fake "primary" that hands out a nonce and answers AUTH with +OK, as anyone posing at the endpoint could:
+        // the standby must refuse it before taking anything from it (003 should-fix 4).
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var (server, client) = DuplexPair();
+        var fake = Task.Run(async () =>
+        {
+            var buffer = new byte[4096];
+            _ = await server.ReadAsync(buffer, cts.Token); // HELLO
+            var hello = new RespWriter().ArrayHeader(6).Integer(ReplicationProtocol.Version).BulkString("impostor")
+                .BulkString(ReplicationProtocol.RolePrimary).Integer(1).BulkString(ReplicationProtocol.Format)
+                .BulkString(Convert.ToHexStringLower(ReplicationProtocol.NewNonce()));
+            await server.WriteAsync(hello.ToArray(), cts.Token);
+            _ = await server.ReadAsync(buffer, cts.Token); // AUTH
+            await server.WriteAsync(new RespWriter().SimpleString("OK").ToArray(), cts.Token);
+        });
+
+        var standby = new ReplicationClient(client, "standby-node", Secret);
+        var refused = await Assert.ThrowsAsync<ReplicationProtocolException>(
+            () => standby.HandshakeAsync(ReplicationProtocol.RoleStandby, 1, cts.Token));
+        Assert.Contains("did not prove", refused.Message);
+        await fake;
+    }
+
+    [Fact]
     public async Task ReplayedResponse_OnANewConnection_IsRefused()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -214,7 +240,9 @@ public sealed class ReplicationProtocolTests
 
         public async Task<RespValue> AuthAsync(string response, CancellationToken ct)
         {
-            await SendAsync([Text.UTF8.GetBytes("AUTH"), Text.UTF8.GetBytes(response)], ct);
+            // AUTH <response> <ownNonce>: the client's own challenge to the server rides along (mutual authentication).
+            await SendAsync([Text.UTF8.GetBytes("AUTH"), Text.UTF8.GetBytes(response),
+                Text.UTF8.GetBytes(Convert.ToHexStringLower(ReplicationProtocol.NewNonce()))], ct);
             return await ReadAsync(ct);
         }
 

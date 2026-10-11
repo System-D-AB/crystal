@@ -54,6 +54,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30)];
 
     private readonly Dictionary<string, (string Name, DateTimeOffset Due, int Attempt)> _pendingBootstraps = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _clashesLogged = new(StringComparer.Ordinal);
     private readonly Task _loop;
 
     private long _lastSetVersion = -1;
@@ -261,8 +262,11 @@ internal sealed class ReplicationFollower : IAsyncDisposable
 
         if (setVersion != _lastSetVersion)
         {
-            Reconcile(primarySet);
-            _lastSetVersion = setVersion;
+            // The set version counts as handled only when every step took effect; otherwise the next pull asks again.
+            if (Reconcile(primarySet))
+            {
+                _lastSetVersion = setVersion;
+            }
         }
 
         return setVersion;
@@ -275,7 +279,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
     /// standby's own databases is logged and left unfollowed. A UID the standby does not have yet is recorded as
     /// pending — T10 bootstraps it, then it joins the followed set.
     /// </summary>
-    private void Reconcile(IReadOnlyList<ReplicatedDatabase> primarySet)
+    private bool Reconcile(IReadOnlyList<ReplicatedDatabase> primarySet)
     {
         var local = _engine.LocalDatabasesForReconcile();
         var localByUid = local.Where(d => d.Replicated).ToDictionary(d => d.Uid, StringComparer.Ordinal);
@@ -283,23 +287,45 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             primarySet,
             local);
 
-        foreach (var step in plan)
+        // Applied by UID, never by name, in an order where no step meets a name another still holds (003 should-fix 2):
+        // 1. drop what the primary no longer lists, freeing its names;
+        // 2. move every database to be renamed to a temporary name, then to the primary's name, so a swap or a chain of
+        //    renames never meets a name still held;
+        // 3. bootstrap the new ones last, under names now free.
+        var complete = true;
+        foreach (var step in plan.Where(s => s.Action == ReconcileAction.Drop))
         {
-            switch (step.Action)
+            complete &= TryDropByUid(step.Uid);
+        }
+
+        var renames = plan.Where(s => s.Action == ReconcileAction.Rename).ToList();
+        foreach (var step in renames)
+        {
+            complete &= TryRenameByUid(step.Uid, ReconcileTemporaryName(step.Uid));
+        }
+
+        foreach (var step in renames)
+        {
+            complete &= TryRenameByUid(step.Uid, step.ToName!);
+        }
+
+        foreach (var step in plan.Where(s => s.Action == ReconcileAction.NameClash))
+        {
+            // Not complete: reconcile runs again on every pull until the product frees the name, then follows it. Logged
+            // once per database, not on every pull.
+            if (_clashesLogged.Add(step.Uid))
             {
-                case ReconcileAction.Rename when localByUid.TryGetValue(step.Uid, out var mine):
-                    TryRename(mine.Name, step.ToName!);
-                    break;
-                case ReconcileAction.Drop:
-                    TryDrop(step.FromName!);
-                    break;
-                case ReconcileAction.NameClash:
-                    _logger?.LogWarning("[replication] a primary database name clashes with a local one; not following it until resolved");
-                    break;
-                case ReconcileAction.CreateAndBootstrap:
-                    TryBootstrap(step.Uid, step.ToName!);
-                    break;
+                _logger?.LogWarning(
+                    "[replication] the primary's database '{Name}' clashes with one of this node's own; not followed until the name is freed",
+                    step.ToName);
             }
+
+            complete = false;
+        }
+
+        foreach (var step in plan.Where(s => s.Action == ReconcileAction.CreateAndBootstrap))
+        {
+            TryBootstrap(step.Uid, step.ToName!); // a failure is retried on its own schedule
         }
 
         // Follow every listed UID the standby already has open (or can open), stopping local writes on it (R1.6). A
@@ -323,7 +349,16 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                 _followed[remote.Uid] = new StandbyDatabase(slot, remote.Uid, _dataDirectory, _epoch.Epoch);
             }
         }
+
+        return complete;
     }
+
+    /// <summary>
+    /// The name a database holds between the two steps of a reconcile rename. Not reserved (a name starting with '_'
+    /// would make the registry refuse to open after a crash between the steps), and unique by UID; the next reconcile
+    /// renames it on to the primary's name.
+    /// </summary>
+    internal static string ReconcileTemporaryName(string uid) => "~reconcile-" + uid;
 
     /// <summary>
     /// Bootstraps a new replicated database over its own connection (design § 7): download the snapshot, verify it,
@@ -532,34 +567,51 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         return null;
     }
 
-    private void TryRename(string fromName, string toName)
+    /// <summary>Renames the replicated database <paramref name="uid"/> to <paramref name="name"/>; true if it now has it.</summary>
+    private bool TryRenameByUid(string uid, string name)
     {
         try
         {
-            var handle = _store.OpenDatabase(fromName);
-            _engine.RenameDatabase(handle, toName); // the engine, not the store: a standby's own reconcile (R1.4)
+            if (_engine.OpenReplicatedByUid(_store, uid) is not { } slot)
+            {
+                return false;
+            }
+
+            if (!string.Equals(slot.Handle.Name, name, StringComparison.Ordinal))
+            {
+                _engine.RenameDatabase(slot.Handle, name); // the engine, not the store: a standby's own reconcile (R1.4)
+            }
+
+            return true;
         }
-        catch (Exception ex) when (ex is DatabaseNotFoundException or DatabaseNameTakenException)
+        catch (Exception ex) when (ex is DatabaseNotFoundException or DatabaseNameTakenException or ArgumentException)
         {
-            _logger?.LogWarning("[replication] reconcile rename could not complete ({Error})", ex.Message);
+            _logger?.LogWarning("[replication] reconcile rename could not complete ({Error}); tried again on the next pull", ex.Message);
+            return false;
         }
     }
 
-    private void TryDrop(string name)
+    /// <summary>Drops the replicated database <paramref name="uid"/>; true once it is gone.</summary>
+    private bool TryDropByUid(string uid)
     {
         try
         {
-            var handle = _store.OpenDatabase(name);
-            if (_followed.Remove(handle.Uid, out var db))
+            if (_engine.OpenReplicatedByUid(_store, uid) is not { } slot)
+            {
+                return true; // already gone
+            }
+
+            if (_followed.Remove(uid, out var db))
             {
                 db.StopFollowing();
             }
 
-            _engine.DropDatabase(handle); // the engine, not the store: a standby's own reconcile (R1.4)
+            _engine.DropDatabase(slot.Handle); // the engine, not the store: a standby's own reconcile (R1.4)
+            return true;
         }
         catch (DatabaseNotFoundException)
         {
-            // Already gone.
+            return true; // already gone
         }
     }
 

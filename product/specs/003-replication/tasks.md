@@ -562,3 +562,22 @@ reviews of the fixes found more, also fixed. Tests: `tests/SystemD.Crystal.Tests
   a whole prefix of the stream (a new `keys` node command), then byte-identical. With the B3 defect put back in the
   source, the failover test fails. The node host now opens databases by name on every command, since a reinstalled
   database has a new handle.
+
+### Should-fix items 2, 4 and 5 (2026-10-11, at the maintainer's request)
+
+- **2, reconcile.** Steps were applied by name, in the primary's list order with drops last, and an install could take
+  a name another database held: "drop `a`, create a new `a`" could drop the new one, and a swap failed and still
+  counted as handled. Now: by UID; drops, then renames through a temporary name, then bootstraps; an install refuses a
+  name another database holds; the set version is handled only when every step took effect. Tests (`ReconcileTests`,
+  6): a swap; a drop and a new database under the same name; a chain of renames; a rename and a new database under the
+  old name; a name clash followed once the standby frees the name with no change on the primary; an install refused
+  over a held name. Three mutations, each caught.
+- **4, a hostile primary.** Path containment and size bounds were done with T10. Now also: reply nesting limited to
+  16 arrays (a deep reply used to recurse until the stack overflowed); an array count that cannot fit the frame is
+  refused and no array is sized from a declared count; and **authentication is mutual** — `AUTH` carries the
+  standby's nonce and the primary must answer with its proof, which the standby checks before taking anything (design
+  § 8 amended). Tests (`RespTests` 4, `ReplicationProtocolTests` 1). Three mutations, each caught.
+- **5, pulls and role changes.** A pull checked the role once at its start and stamped entries with an epoch adopted
+  while it waited; a role or epoch change did not wake it; and one semaphore woke one waiter of several. Now: a change
+  counter wakes every waiting pull on a commit, a set change, an epoch or a role change; a pull checks the role and
+  epoch again before it answers. Tests (`PullWaitTests`, 3). Four mutations, each caught.

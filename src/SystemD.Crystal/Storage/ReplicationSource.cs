@@ -37,7 +37,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
     private readonly SnapshotSessions _snapshots;
 
     // A single store-wide change signal: a commit in any database, or a set-version change, releases a waiting pull.
-    private readonly SemaphoreSlim _change = new(0);
+    private readonly ChangeSignal _change = new();
     private volatile bool _disposed;
 
     public ReplicationSource(CrystalStore store, StoreEngine engine, string nodeId, ReplicationEpoch epoch, ReplicationOptions options)
@@ -352,25 +352,34 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
         AgeSlots(); // R2.3: every contact re-evaluates every slot
 
-        // Drain any stale change signal BEFORE building entries, so a commit that fires after the build is not lost
-        // (if we drained after the build, a commit landing between the build and the drain would be swallowed and the
-        // pull would wait out the full waitMs despite data being ready — a lost wakeup).
-        while (_change.CurrentCount > 0)
-        {
-            _change.Wait(0);
-        }
-
-        // Build the entries once; if every database is caught up and nothing is to be sent, wait for a fresh commit /
-        // set-version change up to waitMs, then build once more. A standby's position is its slot's acked value above.
+        // The mark is taken BEFORE building entries, so a change that lands after the build still wakes the wait below.
+        // Build the entries once; if every database is caught up and nothing is to be sent, wait for a commit, a
+        // set-version change, or an epoch or role change, up to waitMs, then build once more.
+        var epoch = _epoch.Epoch;
+        var mark = _change.Mark;
         var entries = BuildEntries(requests, maxBytes);
-        if (waitMs > 0 && NothingToSend(entries) && _change.Wait(waitMs))
+        if (waitMs > 0 && NothingToSend(entries) && _change.WaitForChange(mark, waitMs))
         {
             entries = BuildEntries(requests, maxBytes);
         }
 
+        // The role and epoch are checked again before answering (003 should-fix 5): a node that stood down, or moved to
+        // another epoch, while this pull waited answers as not primary rather than stamping entries with a history it
+        // no longer serves. The standby reconnects and learns the new state.
+        if (!IsPrimary(reply))
+        {
+            return;
+        }
+
+        if (_epoch.Epoch != epoch)
+        {
+            reply.Error($"{ReplicationProtocol.ErrNotPrimary} {_epoch.Epoch} {_epoch.RoleName}");
+            return;
+        }
+
         // [epoch, setVersion, [entry…]] (design § 8.2).
         reply.ArrayHeader(3)
-            .Integer(_epoch.Epoch)
+            .Integer(epoch)
             .Integer(_engine.ReplicatedSetVersion)
             .ArrayHeader(entries.Count);
         foreach (var entry in entries)
@@ -823,21 +832,10 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         return scope is null ? null : serving!.Latest;
     }
 
-    private void Signal()
-    {
-        // Release one waiter; a bounded release keeps the semaphore from growing without bound under a commit storm.
-        if (_change.CurrentCount == 0)
-        {
-            try
-            {
-                _change.Release();
-            }
-            catch (SemaphoreFullException)
-            {
-                // Another thread released concurrently; the waiter is already going to wake.
-            }
-        }
-    }
+    private void Signal() => _change.Signal();
+
+    /// <summary>Wakes every waiting pull: the role or epoch changed (R3.4), and each must answer for the new state.</summary>
+    internal void SignalRoleOrEpochChange() => _change.Signal();
 
     private bool IsPrimary(RespWriter reply)
     {
@@ -876,7 +874,6 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         }
 
         _slotTimer.Dispose();
-        _change.Dispose();
         _snapshots.Dispose();
     }
 

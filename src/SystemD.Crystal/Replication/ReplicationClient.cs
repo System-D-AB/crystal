@@ -78,9 +78,12 @@ internal sealed class ReplicationClient
         var nonceHex = Text.UTF8.GetString(fields[5].Bytes ?? []);
         var nonce = Convert.FromHexString(nonceHex);
 
-        // AUTH <hmacHex>
+        // AUTH <hmacHex> <standbyNonceHex>: this node's answer to the primary's challenge, and its own challenge to the
+        // primary, which must answer with its proof. Authentication goes both ways: a standby never takes pages, epochs
+        // or snapshots from an endpoint that cannot show it holds the secret (003 should-fix 4).
         var response = ReplicationProtocol.Response(_secret, nonce, _nodeId);
-        await SendAsync([Bytes(ReplicationProtocol.Auth), Bytes(response)], ct).ConfigureAwait(false);
+        var myNonce = ReplicationProtocol.NewNonce();
+        await SendAsync([Bytes(ReplicationProtocol.Auth), Bytes(response), Bytes(Convert.ToHexStringLower(myNonce))], ct).ConfigureAwait(false);
 
         var auth = await ReadReplyAsync(ct).ConfigureAwait(false);
         if (auth.Type == RespType.Error)
@@ -88,9 +91,12 @@ internal sealed class ReplicationClient
             throw new ReplicationProtocolException(auth.Text ?? "AUTH refused");
         }
 
-        if (auth.Type != RespType.SimpleString || auth.Text != "OK")
+        var expected = ReplicationProtocol.Proof(_secret, myNonce, PrimaryNodeId);
+        var proof = auth.Type == RespType.BulkString ? Text.ASCII.GetString(auth.Bytes ?? []) : string.Empty;
+        if (!ReplicationProtocol.ResponsesEqual(expected, proof))
         {
-            throw new ReplicationProtocolException("AUTH did not return OK");
+            throw new ReplicationProtocolException(
+                $"{ReplicationProtocol.ErrAuth} the peer at this endpoint did not prove it holds the replication secret; nothing is taken from it");
         }
     }
 

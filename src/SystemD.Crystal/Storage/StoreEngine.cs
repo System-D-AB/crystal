@@ -642,6 +642,17 @@ internal sealed class StoreEngine : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
+            // A new database takes its name only if no other holds it (003 should-fix 2): never overwrite another's alias.
+            // Checked before anything is closed or moved.
+            if (_aliases.TryGetValue(name, out var holder)
+                && !string.Equals(_records[holder].Uid, uid, StringComparison.Ordinal))
+            {
+                throw new DatabaseNameTakenException(
+                    name,
+                    $"Database '{name}' is held by another database here (id {holder}); the snapshot of {uid} is installed once " +
+                    "reconcile frees the name (R1.4).");
+            }
+
             // The snapshot replaces this node's log with what it received: none of its own history may be continued.
             IncarnationRecord.Delete(_dataDirectory, uid);
 

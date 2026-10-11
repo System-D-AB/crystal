@@ -138,6 +138,18 @@ pull, so a catch-up costs one round trip per page); `PULL` every followed databa
 divergence, apply its batches, or act on gap/diverged/gone; pull again. On connection loss, reconnect with backoff
 0.2, 0.5, 1, 2, 5 s (capped), forever, cancellable.
 
+**Reconcile** applies the primary's set **by UID, never by name**, in an order where no step meets a name another
+still holds: first it drops the replicated databases the primary no longer lists; then it moves every database to be
+renamed to a temporary name (`~reconcile-{uid}`, valid so that a crash between the steps leaves a store that opens) and
+on to the primary's name, which handles swaps and chains of renames; then it bootstraps the new ones. An install never
+takes a name another database holds. The set version counts as handled only when every step took effect, so a step
+that failed, or a name clash with one of the standby's own databases, is tried again on the next pull (a clash is
+logged once).
+
+A waiting pull wakes on any commit, a change of the set, the epoch or the role, and **every** waiting pull wakes, not
+one of several. It checks the role and epoch again before it answers: one that stood down or moved to another epoch
+while it waited answers `CRYSTAL_NOTPRIMARY`, so no reply is stamped with a history the node no longer serves.
+
 ## 5. Applying, gaps, divergence
 
 - **Apply** (`BatchApplier` over `StandbyDatabase`): skip batches at or below the position; concatenate a contiguous
@@ -225,7 +237,7 @@ cap, or any malformed frame, closes the connection without an answer.
 | Command | Request | Reply |
 |---|---|---|
 | `HELLO` | `HELLO <protocolVersion> <nodeId> <role> <epoch> <format> <layout>` | `[protocolVersion, nodeId, role, epoch, format, nonce]` |
-| `AUTH` | `AUTH <hmacHex>` | `+OK` |
+| `AUTH` | `AUTH <hmacHex> <ownNonceHex>` | bulk string: the server's proof, `hex(HMAC-SHA256(secret, ownNonce ‖ serverNodeId))` |
 | `DATABASES` | `DATABASES` | `[setVersion, [[uid, name, latest]…]]` |
 | `PULL` | `PULL <maxBytes> <waitMs> (<uid> <from>)…` | `[epoch, setVersion, [entry…]]` |
 | `SNAPSHOT BEGIN` | `SNAPSHOT BEGIN <uid> <format> <layout>` | `[epoch, uid, session, incarnation, base, checkpointSeq, [[file, size, crc32c]…], format]` |
@@ -236,6 +248,11 @@ cap, or any malformed frame, closes the connection without an answer.
 - `role` is `primary`, `standby` or `fenced`; `format` is `crystal 1`; `layout` is `default,general,delete_heavy`.
 - `nonce` is 32 random bytes, hex; `hmacHex = hex(HMAC-SHA256(secret, nonce ‖ requesterNodeId))`. The secret never
   crosses the wire; a nonce is valid for one `AUTH` on its connection only.
+- **Authentication goes both ways.** `AUTH` carries the requester's own 32-byte nonce, and the server answers with its
+  proof over it. A standby refuses a primary whose proof is missing or wrong before it takes a page, an epoch or a
+  snapshot from it: anyone who can answer at the endpoint otherwise could feed it data.
+- **A reply is read defensively.** Arrays may nest at most 16 deep, a declared array count must fit the frame cap at
+  three bytes an element, and no array is sized from its declared count alone.
 - A **PULL entry** is `[uid, status, incarnation, base, latest, batchesOrGap, history]`, where `status` is `ok`,
   `gap`, `diverged` or `gone`; for `ok`, `batchesOrGap` is `[[seq, bytes]…]` (possibly empty); for `gap`, it is the
   first available sequence as an integer; `history` is `[[incarnation, end]…]`, the earlier incarnations the log

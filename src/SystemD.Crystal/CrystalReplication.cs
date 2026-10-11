@@ -78,7 +78,14 @@ public sealed class CrystalReplication : IDisposable
 
         // 003 addendum B2: local writes to replicated databases follow the role, from the role this node starts in.
         _engine.WriteGate.Set(_epoch.Role);
-        _epoch.RoleChanged = _engine.WriteGate.Set;
+        _epoch.RoleChanged = role =>
+        {
+            _engine.WriteGate.Set(role);
+
+            // Waiting pulls answer for the new state at once (R3.4). Read without the facade's lock: this runs inside
+            // the epoch's lock, and taking ours here could deadlock with a promotion holding ours and waiting for it.
+            Volatile.Read(ref _source)?.SignalRoleOrEpochChange();
+        };
         _metrics = new Observability.ReplicationMetrics(
             meterFactory, nodeId, () => _epoch.Epoch, () => _epoch.RoleName,
             () => Source?.Slots() ?? [],

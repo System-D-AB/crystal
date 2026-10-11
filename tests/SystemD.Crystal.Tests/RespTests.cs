@@ -306,6 +306,45 @@ public sealed class RespTests
     }
 
     [Fact]
+    public void Reply_NestedDeeperThanTheLimit_IsProtocolError_NotAStackOverflow()
+    {
+        // A peer sending "*1\r\n" over and over would recurse once per level (003 should-fix 4).
+        var frame = Text.ASCII.GetBytes(string.Concat(Enumerable.Repeat("*1\r\n", 100_000)) + ":1\r\n");
+        var status = RespReader.TryReadReply(Seq(frame), maxFrameBytes: 64 * 1024 * 1024, out _, out _, out var error);
+        Assert.Equal(RespReadStatus.ProtocolError, status);
+        Assert.Contains("deeper", error);
+    }
+
+    [Fact]
+    public void Reply_NestedToTheLimit_IsRead()
+    {
+        var frame = Text.ASCII.GetBytes(string.Concat(Enumerable.Repeat("*1\r\n", RespReader.MaxDepth)) + ":7\r\n");
+        var status = RespReader.TryReadReply(Seq(frame), maxFrameBytes: 1024, out var value, out _, out _);
+        Assert.Equal(RespReadStatus.Complete, status);
+        Assert.NotNull(value);
+    }
+
+    [Fact]
+    public void Reply_ArrayCountThatCannotFitTheFrame_IsProtocolError_BeforeAnythingIsAllocated()
+    {
+        // Under the byte cap as a number, but every element takes at least three bytes: 50 000 000 elements cannot fit in
+        // 64 MiB, so the count is refused instead of sizing an array of 50 000 000 references (003 should-fix 4).
+        var frame = Text.ASCII.GetBytes("*50000000\r\n");
+        var status = RespReader.TryReadReply(Seq(frame), maxFrameBytes: 64 * 1024 * 1024, out _, out _, out var error);
+        Assert.Equal(RespReadStatus.ProtocolError, status);
+        Assert.Contains("cannot fit", error);
+    }
+
+    [Fact]
+    public void Reply_ALargeHonestArray_IsReadInFull()
+    {
+        var frame = Text.ASCII.GetBytes("*3000\r\n" + string.Concat(Enumerable.Repeat(":1\r\n", 3000)));
+        var status = RespReader.TryReadReply(Seq(frame), maxFrameBytes: 1024 * 1024, out var value, out _, out _);
+        Assert.Equal(RespReadStatus.Complete, status);
+        Assert.Equal(3000, value!.Items!.Count);
+    }
+
+    [Fact]
     public void Reply_ArrayCountAboveCap_IsProtocolError()
     {
         // An array declaring more elements than the cap is refused before `new RespValue[count]` runs: each element
