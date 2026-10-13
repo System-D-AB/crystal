@@ -5,7 +5,7 @@ namespace SystemD.Crystal;
 /// <summary>
 /// Every event Crystal logs, with a stable id an operator can filter and alert on across versions (spec 007 R3.1).
 /// Ids are grouped by area and never reused: 1000s the store, 1100s the registry, 1200s startup recovery, 1300s
-/// databases, 1400s boxes, 1500s durability, 1600s storage, 2000s replication (spec 003). Messages never contain a key,
+/// databases, 1400s boxes, 1500s durability, 1600s storage, 1700s backup and restore (spec 010), 2000s replication (spec 003). Messages never contain a key,
 /// a value or a credential (R3.4).
 /// </summary>
 public static class CrystalLogEvents
@@ -96,6 +96,35 @@ public static class CrystalLogEvents
 
     /// <summary>Information: a write stall or slowdown ended.</summary>
     public static readonly EventId WriteStallEnded = new(1602, nameof(WriteStallEnded));
+
+    // ---- 1700s: backup and restore (spec 010 R7.1) ----------------------------
+
+    /// <summary>Information: a backup began.</summary>
+    public static readonly EventId BackupStarted = new(1701, nameof(BackupStarted));
+
+    /// <summary>Information: a backup completed; its set exists.</summary>
+    public static readonly EventId BackupCompleted = new(1702, nameof(BackupCompleted));
+
+    /// <summary>Error: a backup failed or was cancelled; no set was written.</summary>
+    public static readonly EventId BackupFailed = new(1703, nameof(BackupFailed));
+
+    /// <summary>Warning: a database live when the backup began is not in its set (dropped during it).</summary>
+    public static readonly EventId BackupDatabaseOmitted = new(1704, nameof(BackupDatabaseOmitted));
+
+    /// <summary>Information: a restore began.</summary>
+    public static readonly EventId RestoreStarted = new(1711, nameof(RestoreStarted));
+
+    /// <summary>Information: a restore completed; its databases are registered.</summary>
+    public static readonly EventId RestoreCompleted = new(1712, nameof(RestoreCompleted));
+
+    /// <summary>Error: a restore failed; nothing was registered.</summary>
+    public static readonly EventId RestoreFailed = new(1713, nameof(RestoreFailed));
+
+    /// <summary>Error: a verify found a damaged database backup.</summary>
+    public static readonly EventId BackupVerifyFailed = new(1721, nameof(BackupVerifyFailed));
+
+    /// <summary>Information: a purge completed.</summary>
+    public static readonly EventId BackupPurged = new(1731, nameof(BackupPurged));
 
     // ---- 2000s: replication (spec 003 R13.3) ----------------------------------
 

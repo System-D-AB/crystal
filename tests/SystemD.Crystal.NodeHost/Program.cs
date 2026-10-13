@@ -19,7 +19,7 @@ namespace SystemD.Crystal.NodeHost;
 /// </code>
 /// Commands: <c>ping</c>, <c>create</c> (db), <c>box</c> (db, box), <c>put</c> (db, box, key, value, durability?),
 /// <c>delete</c> (db, box, key), <c>get</c> (db, box, key), <c>count</c> (db, box), <c>sync</c>, <c>status</c>,
-/// <c>exit</c>. Keys and values are UTF-8 text. <c>listen</c>, <c>follow</c>, <c>promote</c>, <c>demote</c> and
+/// <c>exit</c>, <c>backup</c> (root: a backup set's id, spec 010). Keys and values are UTF-8 text. <c>listen</c>, <c>follow</c>, <c>promote</c>, <c>demote</c> and
 /// <c>fence</c> are reserved for spec 003 and refused until it exists. The port is the node's replication port,
 /// chosen free by <c>TestNode</c> and reported back; nothing listens on it until spec 003.
 /// </remarks>
@@ -282,6 +282,8 @@ internal static class Program
                 case "rejoin":
                     store.Replication.ScheduleRejoin(Text(request, "endpoint"));
                     return null;
+                case "backup": // spec 010: a backup of every database into the root; the set's id
+                    return store.BackupAsync(Text(request, "root")).GetAwaiter().GetResult().SetId;
                 default:
                     throw new ArgumentException($"Unknown command '{cmd}'.");
             }

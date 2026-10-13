@@ -1,6 +1,6 @@
 # 011 — Replication completion
 
-> **Status:** approved (2026-10-12). **Depends on:** `003-replication` (everything here completes it),
+> **Status:** implemented (2026-10-13). **Depends on:** `003-replication` (everything here completes it),
 > `009-self-describing-databases` (databases are reconciled by UID), `005-store-and-databases` (the registry, the
 > allocator, the store gate), `006-durability` (sync rules), `007-observability` (meter, log events, `Status()`).
 > **Uses:** `004-test-suite` (test nodes, the crash harness).

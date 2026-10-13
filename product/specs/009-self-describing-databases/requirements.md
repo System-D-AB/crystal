@@ -114,3 +114,11 @@ and the database brings everything else. `010-backup-and-restore` builds on that
 ## Open questions
 
 None. The upgrade question was settled by the maintainer on 2026-10-10: there are no databases to upgrade (R4.1).
+
+## Addendum 2026-10-13: the one exception to R1.1
+
+R1.1 says the identity record never changes after the database is created. `010` (backup and restore) needs one
+exception: a database **restored as a copy** (`RestoreOptions.NewIdentity`) is given a new UID, written into its identity
+record while no registry names it, before it is registered; its kind and creation time are kept. That is the only place
+an identity record is rewritten, through an internal `DatabaseContext.ReplaceIdentityUid`, and never after
+registration. Everything else in R1.1 stands.

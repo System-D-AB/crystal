@@ -1,6 +1,6 @@
 # 010 — Backup and restore
 
-> **Status:** drafted (2026-10-10). **Depends on:** `009-self-describing-databases` (a database carries its own
+> **Status:** implemented (2026-10-14; approved and amended 2026-10-13, see the addendum at the end). **Depends on:** `009-self-describing-databases` (a database carries its own
 > identity, so it moves between stores without `_crystal`), `005-store-and-databases` (the registry, create's crash
 > ordering, the store gate), `001-2-rocksdb-binding` (every native call through `NativeRocks`), `006-durability`,
 > `007-observability`. **Uses:** `004-test-suite` (the crash harness and test nodes).
@@ -256,3 +256,39 @@ These work on a backup root without a store, through `CrystalBackupRoot.Open(pat
    the caller names a local folder. Is the default right?
 2. **A restore into the data directory of a store that is not open** is done by opening it first (R6.1). An offline
    restore tool (a command-line program) is not part of this spec. Is one wanted later?
+
+## Addendum 2026-10-13: after `009`, `003` and `011` were implemented
+
+This spec was drafted before `009` landed and before replication was completed by `011`. `009` was built as this spec
+assumed; replication now gives stores roles, histories and per-database records that a restore must respect. The
+requirements below are added; where they change a requirement above, they say so. The maintainer approved starting
+the work on 2026-10-13; the open questions keep their stated defaults (the scratch folder under the root; no offline
+restore tool for now).
+
+- **R11.1 A drop removes the database's replication records.** Dropping a replicated database deletes its follow
+  record, incarnation record and resync marker (`replication/follow/{uid}.json`, `replication/incarnation/{uid}.json`,
+  `replication/resync/{uid}`), durably. Without this, a restore that brings the UID back would inherit a history it
+  does not have, and a promotion would claim it (a gap in `003` that a restore exposes).
+- **R11.2 A restore clears the same records for each UID it restores,** before it registers them: a crash before
+  R11.1 existed, or a hand-made folder, may have left them. A restored database then starts a fresh history on a
+  primary (it has neither an incarnation record nor a follow record), and its standbys bootstrap it like any new
+  database. This replaces R6.8's first two points; its third is R11.3.
+- **R11.3 A restore of replicated databases is refused unless this node is the primary** and accepts writes: on a
+  standby, a fenced node, or a primary handing over (`011` R14), with `NotPrimaryException`, before anything is written,
+  and admitted through the same write gate as `CreateDatabase`, so a demotion waits for a restore in progress. A
+  database restored as not replicated (`RestoreOptions.Replicated = false`) may be restored on any node. A backup is
+  allowed on any node: it only reads.
+- **R11.4 A restore is a change of the replicated set:** its registry batch goes through the same path as a create, so
+  waiting pulls wake at once (`011` R11.1) and standbys bootstrap the restored databases.
+- **R11.5 Crash ordering as `011` R9:** every rename that publishes state (the root file, a manifest, each restored
+  folder moved into `db-{id}`) is followed by a sync of its directory, and the allocator is advanced before any folder
+  is moved in (as R6.6 already requires).
+- **R11.6 `009` names:** `009` built the identity check as `LoadCatalogue(kind, expectedUid)`; R5.3, R6.6 and the
+  design use it under that name. A restored folder's identity is checked before it is moved into place, as
+  `InstallBootstrap` checks a downloaded snapshot (`009` T3), so a wrong folder never reaches `db-{id}`.
+- **R11.7 `NewIdentity` is `009`'s one exception,** recorded in `009` by its own addendum: the identity record of a
+  database restored as a copy is rewritten with a new UID before it is registered, and never again.
+- **R11.8 Proof:** tests for R11.1 (a drop leaves none of the records), R11.2 (a restored replicated database on a
+  primary has a fresh history: no incarnation of its earlier life is claimed), R11.3 (refused on a standby, a fenced
+  node and during a handover; a not-replicated restore allowed on a standby), and R11.4 (a standby following the
+  primary bootstraps the restored database promptly); each guard with a mutation check.

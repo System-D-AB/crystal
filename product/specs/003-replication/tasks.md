@@ -627,3 +627,6 @@ reviews of the fixes found more, also fixed. Tests: `tests/SystemD.Crystal.Tests
   report, no directory sync after renames and an install that moves its folder before advancing the allocator), and
   minor gaps against R3.4, R3.7, R6.4, R7.1, R7.8, R13 and R15. Each was checked against the code. They are specified
   in `011-replication-completion`; `003` is marked implemented together with `011`.
+- **Implemented (2026-10-13).** Every finding of the third review was fixed in `011-replication-completion`, which also
+  added a planned handover (`StepDownAsync`); two further independent review rounds left no blocker or should-fix item
+  open. `003` and `011` are marked implemented together.

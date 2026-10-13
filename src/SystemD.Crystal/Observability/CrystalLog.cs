@@ -122,6 +122,44 @@ internal static partial class CrystalLog
         Message = "RocksDB resumed writes in {Database}.")]
     public static partial void WriteStallEnded(ILogger logger, string database);
 
+    // ---- 1700s: backup and restore (spec 010 R7.1) ----------------------------
+
+    [LoggerMessage(EventId = 1701, EventName = nameof(CrystalLogEvents.BackupStarted), Level = LogLevel.Information,
+        Message = "Backup {Set} into {Root} started: {Databases} database(s).")]
+    public static partial void BackupStarted(ILogger logger, string root, string set, int databases);
+
+    [LoggerMessage(EventId = 1702, EventName = nameof(CrystalLogEvents.BackupCompleted), Level = LogLevel.Information,
+        Message = "Backup {Set} into {Root} completed: {Databases} database(s), {Omitted} omitted, {Bytes} byte(s) copied in {Milliseconds} ms.")]
+    public static partial void BackupCompleted(ILogger logger, string root, string set, int databases, int omitted, long bytes, double milliseconds);
+
+    [LoggerMessage(EventId = 1703, EventName = nameof(CrystalLogEvents.BackupFailed), Level = LogLevel.Error,
+        Message = "Backup into {Root} failed; no set was written. Earlier sets are untouched.")]
+    public static partial void BackupFailed(ILogger logger, Exception exception, string root);
+
+    [LoggerMessage(EventId = 1704, EventName = nameof(CrystalLogEvents.BackupDatabaseOmitted), Level = LogLevel.Warning,
+        Message = "Backup {Set} into {Root} omits database {Database} ({Uid}): {Reason}.")]
+    public static partial void BackupDatabaseOmitted(ILogger logger, string root, string set, string database, string uid, string reason);
+
+    [LoggerMessage(EventId = 1711, EventName = nameof(CrystalLogEvents.RestoreStarted), Level = LogLevel.Information,
+        Message = "Restore of set {Set} from {Root} started.")]
+    public static partial void RestoreStarted(ILogger logger, string root, string set);
+
+    [LoggerMessage(EventId = 1712, EventName = nameof(CrystalLogEvents.RestoreCompleted), Level = LogLevel.Information,
+        Message = "Restore of set {Set} from {Root} completed: {Databases} database(s) registered.")]
+    public static partial void RestoreCompleted(ILogger logger, string root, string set, int databases);
+
+    [LoggerMessage(EventId = 1713, EventName = nameof(CrystalLogEvents.RestoreFailed), Level = LogLevel.Error,
+        Message = "Restore of set {Set} from {Root} failed; nothing was registered.")]
+    public static partial void RestoreFailed(ILogger logger, Exception exception, string root, string set);
+
+    [LoggerMessage(EventId = 1721, EventName = nameof(CrystalLogEvents.BackupVerifyFailed), Level = LogLevel.Error,
+        Message = "Verify of set {Set} in {Root} found database {Database} damaged: {Problem}")]
+    public static partial void BackupVerifyFailed(ILogger logger, string root, string set, string database, string problem);
+
+    [LoggerMessage(EventId = 1731, EventName = nameof(CrystalLogEvents.BackupPurged), Level = LogLevel.Information,
+        Message = "Purge of {Root}: {Kept} set(s) kept, {Deleted} deleted, {Engines} engine folder(s) removed.")]
+    public static partial void BackupPurged(ILogger logger, string root, int kept, int deleted, int engines);
+
     // ---- 2000s: replication (spec 003 R13.3) ----------------------------------
 
     [LoggerMessage(EventId = 2001, EventName = nameof(CrystalLogEvents.ReplicationPromoted), Level = LogLevel.Information,

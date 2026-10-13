@@ -14,6 +14,7 @@ namespace SystemD.Crystal;
 /// <param name="BlockCacheUsage">Bytes in the store's shared block cache.</param>
 /// <param name="BlockCacheCapacity">Size of the store's shared block cache.</param>
 /// <param name="Databases">Every open database.</param>
+/// <param name="Backup">The backup running now, or null when none is (spec 010 R7.3).</param>
 public sealed record StoreStatus(
     string NodeId,
     string Format,
@@ -21,7 +22,15 @@ public sealed record StoreStatus(
     TimeSpan SyncInterval,
     long BlockCacheUsage,
     long BlockCacheCapacity,
-    IReadOnlyList<DatabaseStatus> Databases);
+    IReadOnlyList<DatabaseStatus> Databases,
+    BackupStatus? Backup = null);
+
+/// <summary>A running backup, in a <see cref="StoreStatus"/> (spec 010 R7.3).</summary>
+/// <param name="Destination">The backup root.</param>
+/// <param name="DatabasesDone">Databases finished (copied or omitted).</param>
+/// <param name="DatabasesTotal">Databases in the backup, read at its start.</param>
+/// <param name="BytesCopied">Bytes copied so far, of finished databases: new files only.</param>
+public sealed record BackupStatus(string Destination, int DatabasesDone, int DatabasesTotal, long BytesCopied);
 
 /// <summary>One open database in a <see cref="StoreStatus"/>.</summary>
 /// <param name="Id">The database id.</param>

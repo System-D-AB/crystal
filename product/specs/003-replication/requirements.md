@@ -1,6 +1,6 @@
 # 003 — Replication
 
-> **Status:** drafted. **Depends on:** `001-2-rocksdb-binding`, `005-store-and-databases`, `002-box-layout`,
+> **Status:** implemented (2026-10-13, completed by `011-replication-completion`). **Depends on:** `001-2-rocksdb-binding`, `005-store-and-databases`, `002-box-layout`,
 > `006-durability`, `007-observability`, and `004-test-suite` T1, T3, T4 (two-process test nodes and the crash harness).
 > **Revised (draft) 2026-10-10**, after a reading of Highway's replication code and the maintainer's decisions:
 > the wire protocol is **a subset of RESP2** on Crystal's own reader and writer (R10); **one `PULL` serves every

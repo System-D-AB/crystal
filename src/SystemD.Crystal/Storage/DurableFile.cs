@@ -48,6 +48,18 @@ internal static partial class DurableFile
         DirectorySynced?.Invoke(directory);
     }
 
+    /// <summary>Deletes <paramref name="path"/> if it exists and syncs its directory, so the deletion survives a power loss.</summary>
+    public static void Delete(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        File.Delete(path);
+        SyncDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+    }
+
     /// <summary>Moves <paramref name="from"/> to <paramref name="to"/>, replacing it, and syncs the directory of <paramref name="to"/>.</summary>
     public static void Replace(string from, string to)
     {

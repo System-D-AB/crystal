@@ -59,6 +59,10 @@ var store = CrystalStore.Open(path, new CrystalOptions
 | `crystal.replication.slot_drops`, `.format_refusals` | counter, `{…}` | — | Standby slots dropped (R2.3); peers refused for a format mismatch (R8). |
 | `crystal.replication.bootstraps` | counter, `{bootstrap}` | — | Snapshot bootstraps installed (R7). |
 | `crystal.replication.pages_applied`, `.bytes_applied` | counter, `{page}`, `By` | — | Pull pages and WAL bytes applied on a standby (R4). |
+| `crystal.backup.duration` | histogram, `s` | — | Duration of each complete backup (spec 010 R7.2). |
+| `crystal.backup.bytes`, `.files` | counter, `By`, `{file}` | — | What backups copied: new files only, not those shared with earlier backups. A second backup after a small change copies little. |
+| `crystal.backup.failures` | counter, `{backup}` | — | Backups that failed, were cancelled or were stopped by a close; none wrote a set. **Alert on it.** |
+| `crystal.backup.last_success` | gauge, `s` | — | Unix time of the last complete set this store wrote since it opened; absent before. **Alert when it ages past the product's backup interval.** |
 
 \* Only with `TagMetricsWithDatabase`; otherwise summed over open databases (the largest, for `write.stopped` and
 `write.delayed_rate`).
@@ -88,6 +92,13 @@ collects them, without holding any store lock, and stop reading when the store c
 | 1502 | `SlowCommit` | Warning | A commit took longer than `SlowCommitThreshold`. |
 | 1601 | `WriteStallStarted` | Warning | RocksDB stopped or slowed writes in a database (checked every second, when a logger is set). |
 | 1602 | `WriteStallEnded` | Information | Writes are back to full speed. |
+| 1701, 1702 | `BackupStarted`, `BackupCompleted` | Information | A backup began (root, set, databases); its set exists (databases, omitted, bytes copied, duration). |
+| 1703 | `BackupFailed` | Error | A backup failed, was cancelled or was stopped by a close; no set was written, earlier sets are untouched. |
+| 1704 | `BackupDatabaseOmitted` | Warning | A database live when the backup began is not in its set: it was dropped during it. |
+| 1711, 1712 | `RestoreStarted`, `RestoreCompleted` | Information | A restore began; its databases are registered. |
+| 1713 | `RestoreFailed` | Error | A restore failed; nothing was registered. |
+| 1721 | `BackupVerifyFailed` | Error | A verify found a database's backup damaged (`CrystalBackupRoot`, through its logger factory). |
+| 1731 | `BackupPurged` | Information | A purge completed: sets kept and deleted, engine folders removed. |
 | 2001 | `ReplicationPromoted` | Information | This node promoted to primary at a new epoch. |
 | 2002 | `ReplicationDemoted` | Information | This node demoted from primary. |
 | 2003 | `ReplicationFenced` | Warning | This node fenced itself read-only. |
@@ -102,7 +113,8 @@ collects them, without holding any store lock, and stop reading when the store c
 | 2012 | `ReplicationDisconnected` | Information | A replication connection was lost. |
 
 Ids are never reused. 1000s the store, 1100s the registry, 1200s recovery, 1300s databases, 1400s boxes, 1500s
-durability, 1600s storage, 2000s replication (`003`).
+durability, 1600s storage, 1700s backup and restore (`010`), 2000s replication (`003`). No backup event names a key or
+a value.
 
 ## 4. Status
 
@@ -112,7 +124,9 @@ listener endpoint and a bounded log of recent transitions; the protocol's `STATU
 `CrystalStore.Status()` returns one consistent snapshot for a product's status or health endpoint: node id, format,
 durability and interval, the shared cache, and per open database its id, name, box count, failed state and cause, last
 successful WAL sync, and RocksDB's view (memtable deletes, keys, live data, pending compaction, SST files and size,
-write stopped). It reads memory and properties only; a database closing meanwhile is left out.
+write stopped). It reads memory and properties only; a database closing meanwhile is left out. While a backup runs,
+`Backup` names its root, the databases done and to do, and the bytes copied so far (spec 010 R7.3); it is null
+otherwise.
 
 ## 5. What is not here
 

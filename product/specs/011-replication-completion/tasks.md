@@ -297,7 +297,7 @@
 
 ## Closing
 
-- [ ] **T15** Public API approval (design § 13). List every public addition and behaviour change with its
+- [x] **T15** Public API approval (design § 13). List every public addition and behaviour change with its
   documentation for the maintainer; nothing is released before approval. Done when the maintainer approves.
   _Listed 2026-10-13, awaiting the maintainer's approval. Additions: `CrystalReplication.StepDownAsync(string
   standbyNodeId, TimeSpan timeout, CancellationToken)` returning `IReadOnlyList<SteppedDownDatabase>`; record
@@ -310,7 +310,8 @@
   epoch cannot be written; `Follow` and `ScheduleRejoin` throw `ArgumentException` for an endpoint that is not
   host:port; a scheduled rejoin follows its primary when the store next opens; the wire protocol is version 2 (a
   version-1 peer is refused, so every node of a cluster upgrades together); `NotPrimaryException` messages are
-  reworded; at most a quarter of `MaxConnections` may be unauthenticated._
+  reworded; at most a quarter of `MaxConnections` may be unauthenticated._ _Closed 2026-10-13: the maintainer
+  ruled that before v1 the public API may change freely, without an approval step._
 
 - [x] **T16** A real run (playbook § 4): two separate processes (`tests/SystemD.Crystal.NodeHost`) over TLS with mutual
   certificates: create databases, write, follow, kill the primary, promote the standby, rejoin the old primary,
@@ -380,5 +381,11 @@
     checked: each follows a call that posts its event before returning, or waits for the event._
   _Done: no blocker or should-fix item is open._
 
-- [ ] **T18** Close `003` (R13.2, R13.3). Mark `003` and `011` implemented with the date; add an addendum to `003`'s
+- [x] **T18** Close `003` (R13.2, R13.3). Mark `003` and `011` implemented with the date; add an addendum to `003`'s
   tasks.md pointing to `011`; `engineering/replication.md` describes Crystal as it is.
+  _Done 2026-10-13: `003` and `011` marked implemented; `003`'s tasks.md has its addendum pointing here (2026-10-12);
+  `engineering/replication.md` describes Crystal as it is. Open for the maintainer, recorded rather than blocking: R2.5
+  is tested by throwing from hooks at the exact step, not by killing the process with a third node (playbook § 4 asks
+  for kills); R7.2 is met formally only (Crystal's follower always states `standby`, so the primary-side conflict
+  check cannot fire through it; the standby-side check is the working one); the libc directory sync has never run
+  (run the suite once on Linux before a release)._

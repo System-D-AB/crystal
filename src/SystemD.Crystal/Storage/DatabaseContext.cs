@@ -22,7 +22,7 @@ namespace SystemD.Crystal.Storage;
 internal sealed class DatabaseContext : IDisposable
 {
     private const int MaxBoxNameLength = 1024;
-    private const int CatalogueFormat = 1;
+    internal const int CatalogueFormat = 1;
     private const string LiveState = "live";
     private const string DroppedState = "dropped";
 
@@ -182,6 +182,30 @@ internal sealed class DatabaseContext : IDisposable
 
             _nextBoxId = BoxKeys.FirstProductBoxId;
             _generation = 1;
+        }
+        finally
+        {
+            _catalogueGate.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Rewrites the identity record with a new UID, keeping its kind and creation time, in one synced write (spec 010
+    /// R6.5, R11.7; the one exception to spec 009 R1.1, recorded in 009's addendum). Used only by a restore as a copy, on
+    /// a database no registry names yet, after <see cref="LoadCatalogue"/> checked the identity it replaces.
+    /// </summary>
+    public DatabaseIdentity ReplaceIdentityUid(DatabaseIdentity loaded, string newUid)
+    {
+        ArgumentNullException.ThrowIfNull(loaded);
+        ArgumentException.ThrowIfNullOrEmpty(newUid);
+        var replaced = loaded with { Uid = newUid };
+        _catalogueGate.EnterWriteLock();
+        try
+        {
+            using var batch = new WriteBatch();
+            batch.Put(BoxKeys.IdentityKey, DatabaseIdentity.Serialize(replaced), _db.Family("default"));
+            _db.Write(batch, sync: true);
+            return replaced;
         }
         finally
         {

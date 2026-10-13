@@ -4,7 +4,7 @@
 > store and databases (§ 2) are implemented by spec `005-store-and-databases`; the RocksDB layer under it by
 > `001-2-rocksdb-binding`; the box layout, catalogue, encoding, locks, batches and scans (§ 3–§ 7) by `002-box-layout`.
 > Durability modes and workload profiles beyond the defaults (§ 6, § 8) are later specs. Replication (§ 9) is built by
-> spec `003`; see [`replication.md`](replication.md). Backup beyond the checkpoint primitive is a later spec.
+> spec `003`; see [`replication.md`](replication.md). Backup and restore (§ 9) by spec `010`; see [`backup.md`](backup.md).
 > Where this document and the code disagree, one of them has a defect, and it is fixed or recorded, never left silent.
 
 ## 1. Terms
@@ -43,7 +43,8 @@
     rejoin                  a node to rejoin a named primary on its next follow
     reconciliation/*.json   demote reports: what this node committed beyond any standby's acknowledgement, by box
   db-{id}.checkpoint-{s}/   a primary's live snapshot checkpoint for a standby's bootstrap (hard links; deleted at END)
-  _backups/{utc}/db-{id}    checkpoints with their manifests (which record the id and the name at the time)
+  restore-{guid}/           a restore's staging folder: a database checked here before it moves into db-{id}
+                            (spec 010); one left by a crash is deleted at the next open
 ```
 
 - **The format stamp is checked before anything is written.** Opening reads the stamp first and refuses, writing
@@ -226,3 +227,11 @@ scans accept a lower bound.
   with its size and CRC-32C; the standby downloads it in 1 MiB chunks, verifies, and installs it atomically under the
   primary's UID. A restored or promoted database starts a new replication incarnation (and promotion a new epoch), so
   a standby that applied past the old base re-bootstraps rather than diverge silently.
+- **A backup** (spec `010`) is one RocksDB `BackupEngine` backup per database, kept under a backup root **outside** the
+  data directory, plus a set manifest written last that ties one backup of each database into a set. `_crystal`,
+  `node.id` and `node.epoch` are not in it: each database carries its own identity (§ 4), and the manifest records the
+  names and replicated flags. Each database is captured at its own moment, with every commit acknowledged before its
+  copy began.
+- **A restore attaches** a set's databases to a store with **new ids** from its allocator, like a create, all of them in
+  one registry batch or none. Each keeps its UID (unless restored as a copy, with a new one), its creation time and its
+  boxes. The layout of the root, the manifest and the guarantees are in [`backup.md`](backup.md).

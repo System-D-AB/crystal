@@ -10,13 +10,16 @@ namespace SystemD.Crystal.CrashHarness;
 
 /// <summary>
 /// <code>
-/// write --dir &lt;path&gt; [--mode Strict|Interval|Buffered] [--count N]
+/// write --dir &lt;path&gt; [--mode Strict|Interval|Buffered] [--count N] [--backup &lt;root&gt; --backup-after N]
 /// </code>
 /// Opens the store at <c>--dir</c> (database <see cref="CrashStream.Database"/>, boxes <see cref="CrashStream.Entries"/> and
 /// <see cref="CrashStream.Marks"/>), prints <c>READY &lt;first index&gt;</c>, then commits batch after batch, printing
 /// <c>ACK &lt;index&gt;</c> after each commit returns. Batch <c>i</c> puts <see cref="CrashStream.Key"/>(i) in both boxes,
 /// with <see cref="CrashStream.EntryValue"/>(i) and <see cref="CrashStream.MarkValue"/>(i). With <c>--count</c> it stops after
 /// that many batches in total and prints <c>DONE</c>; without it, it writes until it is killed.
+/// <para>With <c>--backup</c> (spec 010 R9.3), once batch <c>--backup-after</c> is acknowledged it starts a backup into the
+/// root and keeps writing while it runs: it prints <c>BACKUPSTART &lt;last acknowledged index&gt;</c> before the backup
+/// starts and <c>BACKUP &lt;set id&gt;</c> when its set exists.</para>
 /// </summary>
 internal static class Program
 {
@@ -31,6 +34,8 @@ internal static class Program
         string? dir = null;
         long? count = null;
         var mode = DurabilityMode.Strict;
+        string? backupRoot = null;
+        long backupAfter = 0;
         for (var i = 1; i < args.Length; i++)
         {
             switch (args[i])
@@ -43,6 +48,12 @@ internal static class Program
                     break;
                 case "--mode":
                     mode = Enum.Parse<DurabilityMode>(args[++i]);
+                    break;
+                case "--backup":
+                    backupRoot = args[++i];
+                    break;
+                case "--backup-after":
+                    backupAfter = long.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
                     break;
                 default:
                     Console.Error.WriteLine($"unknown argument '{args[i]}'");
@@ -66,6 +77,7 @@ internal static class Program
         var first = NextIndex(db, entries);
         Say($"READY {first}");
 
+        System.Threading.Tasks.Task? backup = null;
         for (var i = first; count is null || i < count; i++)
         {
             using (var batch = db.NewBatch())
@@ -76,7 +88,16 @@ internal static class Program
             }
 
             Say($"ACK {i}"); // only after the commit returned
+            if (backupRoot is not null && backup is null && i >= backupAfter)
+            {
+                Say($"BACKUPSTART {i}");
+                backup = store.BackupAsync(backupRoot).ContinueWith(
+                    t => Say(t.IsCompletedSuccessfully ? $"BACKUP {t.Result.SetId}" : $"BACKUPFAILED {t.Exception?.GetBaseException().Message}"),
+                    System.Threading.Tasks.TaskScheduler.Default);
+            }
         }
+
+        backup?.Wait();
 
         Say("DONE");
         return 0;
@@ -108,9 +129,14 @@ internal static class Program
         return next;
     }
 
+    private static readonly object SayLock = new();
+
     private static void Say(string line)
     {
-        Console.Out.WriteLine(line);
-        Console.Out.Flush();
+        lock (SayLock) // the backup's line comes from another thread
+        {
+            Console.Out.WriteLine(line);
+            Console.Out.Flush();
+        }
     }
 }

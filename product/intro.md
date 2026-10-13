@@ -10,7 +10,8 @@ Crystal gives an application a small set of storage primitives it can trust:
 - **Snapshots and bounded, ordered scans.**
 - **Durability you choose:** buffered, interval-synced, or synced on every commit.
 - **Replication:** a primary and standbys over Crystal's own small protocol and port.
-- **Backup and restore.**
+- **Backup and restore:** incremental, online backups of every database into a root the product names, verified and
+  kept to a retention limit, and restored into a new or running store, all of a set's databases or none.
 - **Format stamps:** a data directory written in a format a build cannot read is refused by name, with the way forward.
 - **Workload profiles:** tuning for general or delete-heavy key spaces.
 

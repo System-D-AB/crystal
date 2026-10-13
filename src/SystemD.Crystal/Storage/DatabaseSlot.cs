@@ -123,6 +123,41 @@ internal sealed class DatabaseSlot
         return new Scope(this);
     }
 
+    private BackupEngineHandle? _runningBackup;
+
+    /// <summary>
+    /// Whether the product holds this database's handle (it created or opened it). A database the backup opened, and
+    /// nobody else asked for meanwhile, is closed again after its copy (spec 010 R3.3).
+    /// </summary>
+    internal bool HandedOut { get; set; }
+
+    /// <summary>
+    /// Registers the copy a backup is running on this database (spec 010 design § 5), so a drop or a store close stops it
+    /// rather than waiting for it. Returns false when the slot is already closing: the copy must not start.
+    /// </summary>
+    internal bool BeginBackup(BackupEngineHandle engine)
+    {
+        // A full fence between this write and the read below, as BeginClose's exchange is on its side: either the
+        // closer sees the copy and stops it, or the copy sees the closing and never starts.
+        Interlocked.Exchange(ref _runningBackup, engine);
+        if (Volatile.Read(ref _closing) != Open)
+        {
+            Volatile.Write(ref _runningBackup, null);
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>Whether the slot was closed by a drop (not by a store close).</summary>
+    internal bool WasDropped => Volatile.Read(ref _closing) == Dropped;
+
+    /// <summary>The copy has ended (spec 010 design § 5).</summary>
+    internal void EndBackup() => Volatile.Write(ref _runningBackup, null);
+
+    /// <summary>Stops a backup copy running on this database, if any (a drop or a close, after <see cref="BeginClose"/>).</summary>
+    internal void StopRunningBackup() => Volatile.Read(ref _runningBackup)?.Stop();
+
     /// <summary>Marks the slot closing; from here every new call is refused. Returns false if it already was.</summary>
     public bool BeginClose(bool dropped) =>
         Interlocked.CompareExchange(ref _closing, dropped ? Dropped : StoreClosed, Open) == Open;

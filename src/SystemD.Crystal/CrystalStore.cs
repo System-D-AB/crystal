@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
+using SystemD.Crystal.Backup;
 using Microsoft.Extensions.Logging;
 using SystemD.Crystal.Observability;
 using SystemD.Crystal.Storage;
@@ -20,6 +22,10 @@ public sealed class CrystalStore : IDisposable
     private readonly StoreEngine _engine;
     private readonly ILogger? _logger;
     private readonly CrystalReplication _replication;
+    private readonly CancellationTokenSource _closing = new(); // cancelled by Dispose: stops a running backup (spec 010 R3.4)
+    private BackupProgress? _backup; // the running backup, if any (spec 010 R1.6)
+    private readonly object _operationsGate = new();
+    private int _operations; // backups and restores running; Dispose waits for them before closing anything
     private int _disposed;
 
     private CrystalStore(string dataDirectory, string nodeId, StoreLock storeLock, StoreEngine engine, ReplicationOptions? replication, System.Diagnostics.Metrics.IMeterFactory? meterFactory, ILogger? logger)
@@ -166,7 +172,10 @@ public sealed class CrystalStore : IDisposable
     public StoreStatus Status()
     {
         ThrowIfDisposed();
-        return _engine.Status(_nodeId);
+        var status = _engine.Status(_nodeId);
+        return Volatile.Read(ref _backup) is { } running
+            ? status with { Backup = new BackupStatus(running.Destination, running.DatabasesDone, running.DatabasesTotal, running.BytesCopied) }
+            : status;
     }
 
     /// <summary>Logs a refused format (spec 007 R3.3, event FormatRefused).</summary>
@@ -251,11 +260,166 @@ public sealed class CrystalStore : IDisposable
     }
 
     /// <summary>
+    /// Backs up every live database into the backup root <paramref name="destination"/> (spec 010 R1): an absolute path,
+    /// empty or already a backup root, outside the data directory. The store keeps serving throughout. Databases are
+    /// backed up one at a time, <b>each captured at its own moment</b>, not one moment across databases (R1.4): a product
+    /// that needs an invariant across data keeps that data in one database. Every commit acknowledged before a database's
+    /// copy began is in it, whatever its durability mode (R1.3). A database dropped during the backup is listed as
+    /// omitted. The set exists once its manifest is written, last; a backup that fails, is cancelled or is killed leaves
+    /// no set and earlier sets untouched (R4.1, R4.4).
+    /// <para><b>Yields:</b> the native work runs on a thread-pool thread (R8.2). Allowed on any node, primary or
+    /// standby: it only reads (R11.3). One backup at a time per store: a second is refused with
+    /// <see cref="BackupInProgressException"/> (R1.6).</para>
+    /// </summary>
+    /// <exception cref="BackupDestinationException">The destination is relative, inside the data directory or containing it, or a non-empty folder that is not a backup root.</exception>
+    /// <exception cref="BackupRootLockedException">Another operation holds the root (R2.4).</exception>
+    /// <exception cref="BackupInProgressException">A backup of this store is running.</exception>
+    /// <exception cref="DatabaseLimitException">A closed database could not be opened for its backup under <c>MaxOpenDatabases</c> (R3.3).</exception>
+    /// <exception cref="OperationCanceledException">The token was cancelled; the copy stops promptly (R4.4).</exception>
+    /// <exception cref="ObjectDisposedException">The store was closed during the backup (R3.4).</exception>
+    public Task<BackupSetInfo> BackupAsync(string destination, BackupOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        options ??= new BackupOptions();
+        ArgumentOutOfRangeException.ThrowIfLessThan(options.BackgroundOperations, 1, nameof(options));
+        if (options.RateLimitBytesPerSecond is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.RateLimitBytesPerSecond, "BackupOptions.RateLimitBytesPerSecond cannot be negative.");
+        }
+
+        var root = BackupRoot.CheckDestination(destination, _dataDirectory);
+        var progress = new BackupProgress(root);
+        if (Interlocked.CompareExchange(ref _backup, progress, null) is { } running)
+        {
+            throw new BackupInProgressException(
+                running.Destination,
+                $"A backup of this store into '{running.Destination}' is running; one backup at a time (spec 010 R1.6). " +
+                "Wait for it to finish, or cancel it.");
+        }
+
+        if (!EnterOperation())
+        {
+            Interlocked.CompareExchange(ref _backup, null, progress);
+            ThrowIfDisposed();
+        }
+
+        var closing = _closing.Token;
+        return Task.Run(
+            () =>
+            {
+                try
+                {
+                    return BackupRunner.Run(this, root, options, progress, closing, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _engine.Metrics?.BackupFailed();
+                    if (_logger is not null)
+                    {
+                        CrystalLog.BackupFailed(_logger, ex, root);
+                    }
+
+                    throw;
+                }
+                finally
+                {
+                    Interlocked.CompareExchange(ref _backup, null, progress);
+                    LeaveOperation();
+                }
+            },
+            CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Attaches databases of backup set <paramref name="setId"/>, in the backup root <paramref name="source"/>, to this
+    /// store (spec 010 R6), all or none: each gets a new id here and keeps its UID, creation time and boxes, unless
+    /// <see cref="RestoreOptions.NewIdentity"/> restores it as a copy with a new UID. Before anything is written the set's
+    /// checksum and formats are checked, each database is quick-verified, and every name and UID must be free here.
+    /// Only once every database is in place and its identity checked are all of them registered, in one synced registry
+    /// batch; until then none is visible. The store keeps serving its other databases. Returns the restored databases.
+    /// <para><b>Yields:</b> the native work runs on a thread-pool thread (R8.2). Restoring replicated databases needs
+    /// this node to be the primary (R11.3); restored as not replicated (<see cref="RestoreOptions.Replicated"/> false),
+    /// they may be restored on any node. A restored replicated database starts a fresh history; standbys bootstrap it
+    /// like any new database (R11.2, R11.4).</para>
+    /// </summary>
+    /// <exception cref="BackupDestinationException">The source is not an absolute path to a backup root.</exception>
+    /// <exception cref="BackupRootLockedException">Another operation holds the root (R2.4).</exception>
+    /// <exception cref="BackupSetNotFoundException">The root has no such set.</exception>
+    /// <exception cref="BackupDamagedException">The manifest, or a chosen database's backup, is damaged.</exception>
+    /// <exception cref="CrystalFormatException">The set records a format this build does not read (R6.2).</exception>
+    /// <exception cref="DatabaseNameTakenException">A restored name is already live here.</exception>
+    /// <exception cref="DatabaseUidTakenException">A restored UID is already live here; restore as a copy instead.</exception>
+    /// <exception cref="NotPrimaryException">Replicated databases, and this node is not the primary accepting writes.</exception>
+    public Task<IReadOnlyList<DatabaseInfo>> RestoreAsync(string source, string setId, RestoreOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrEmpty(source);
+        ArgumentException.ThrowIfNullOrEmpty(setId);
+        options ??= new RestoreOptions();
+        if (!EnterOperation())
+        {
+            ThrowIfDisposed();
+        }
+
+        var closing = _closing.Token;
+        return Task.Run(
+            () =>
+            {
+                try
+                {
+                    return RestoreRunner.Run(this, source, setId, options, closing, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    if (_logger is not null)
+                    {
+                        CrystalLog.RestoreFailed(_logger, ex, source, setId);
+                    }
+
+                    throw;
+                }
+                finally
+                {
+                    LeaveOperation();
+                }
+            },
+            CancellationToken.None);
+    }
+
+    // Counted under a lock that Dispose takes after marking the store disposed: an operation either enters before and is
+    // waited for, or sees the store disposed and never starts.
+    private bool EnterOperation()
+    {
+        lock (_operationsGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return false;
+            }
+
+            _operations++;
+            return true;
+        }
+    }
+
+    private void LeaveOperation()
+    {
+        lock (_operationsGate)
+        {
+            _operations--;
+            Monitor.PulseAll(_operationsGate);
+        }
+    }
+
+    /// <summary>The running backup, for <c>Status()</c> (spec 010 R7.3).</summary>
+    internal BackupProgress? RunningBackup => Volatile.Read(ref _backup);
+
+    /// <summary>
     /// The set of replicated databases is the primary's (spec 003 R1.4, R1.6; addendum 2026-10-10 review): a standby,
     /// demoted or fenced node refuses to change it. Replication's own reconcile changes it through the engine. The
     /// change holds the returned admission until it ends, so a demotion or fence waits for it.
     /// </summary>
-    private static Storage.ReplicationWriteGate.Admission AdmitIfPrimary(Storage.ReplicationWriteGate? gate, string operation)
+    internal static Storage.ReplicationWriteGate.Admission AdmitIfPrimary(Storage.ReplicationWriteGate? gate, string operation)
     {
         var admitted = Storage.ReplicationWriteGate.Admit(gate, out var refusedAs);
         if (refusedAs is { } role)
@@ -287,6 +451,16 @@ public sealed class CrystalStore : IDisposable
             return;
         }
 
+        // A running backup or restore is stopped and waited for before any database closes (spec 010 R3.4, design § 4).
+        _closing.Cancel();
+        lock (_operationsGate)
+        {
+            while (_operations > 0)
+            {
+                Monitor.Wait(_operationsGate);
+            }
+        }
+
         // Stop the listener and follower before the engine closes, so no connection touches a closing database.
         _replication.Dispose();
 
@@ -296,6 +470,7 @@ public sealed class CrystalStore : IDisposable
         }
         finally
         {
+            _closing.Dispose();
             _lock.Dispose();
             if (_logger is not null)
             {

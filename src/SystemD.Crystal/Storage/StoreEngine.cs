@@ -24,7 +24,6 @@ namespace SystemD.Crystal.Storage;
 internal sealed class StoreEngine : IDisposable
 {
     internal const string RegistryFolderName = "_crystal";
-    internal const string BackupsFolderName = "_backups";
     internal const string NameFileName = "name";
 
     /// <summary>The registry's kernel box in <c>_crystal</c> (ids 1–15 are the kernel's; design addendum A4).</summary>
@@ -51,6 +50,9 @@ internal sealed class StoreEngine : IDisposable
     private readonly TimeProvider _clock;
     private readonly ILogger? _logger;
     private readonly StoreResources _resources;
+
+    /// <summary>The store's shared native resources (cache, environment, write budget): backup and restore open with them.</summary>
+    internal StoreResources Resources => _resources;
     private readonly RocksInstance _registryDb;
     private readonly DatabaseContext _registryCatalogue;
 
@@ -493,6 +495,12 @@ internal sealed class StoreEngine : IDisposable
             var dbPath = DatabasePath(id);
             if (record.State == DroppedState)
             {
+                // A crash may have come between the drop's batch and the removal; not when the UID is live again (a
+                // restore may bring a dropped UID back, and its records are its own then).
+                if (!_records.Values.Any(r => r.State == LiveState && string.Equals(r.Uid, record.Uid, StringComparison.Ordinal)))
+                {
+                    ForgetReplicationRecords(record.Uid);
+                }
                 if (Directory.Exists(dbPath))
                 {
                     DeleteDirectoryWithRetries(dbPath);
@@ -548,7 +556,7 @@ internal sealed class StoreEngine : IDisposable
             var name = Path.GetFileName(entry);
             var known = databaseFolders.ContainsKey(entry)
                 || (Directory.Exists(entry) && name == ReplicationFolderName)
-                || (Directory.Exists(entry) && name is RegistryFolderName or BackupsFolderName)
+                || (Directory.Exists(entry) && name == RegistryFolderName)
                 || (File.Exists(entry) && KnownRootFiles.Contains(name, StringComparer.Ordinal));
             if (!known)
             {
@@ -591,6 +599,7 @@ internal sealed class StoreEngine : IDisposable
                 LogRecovered(entry);
             }
             else if (name.StartsWith("bootstrap-", StringComparison.Ordinal)
+                || name.StartsWith(RestoreStagingPrefix, StringComparison.Ordinal) // a restore's, never moved in (spec 010)
                 || (name.StartsWith("db-", StringComparison.Ordinal) && name.Contains(".checkpoint-", StringComparison.Ordinal)))
             {
                 DeleteDirectoryWithRetries(entry);
@@ -682,6 +691,7 @@ internal sealed class StoreEngine : IDisposable
                 _open.Remove(eid);
                 PublishOpenSlots();
                 slot.BeginClose(dropped: false);
+                slot.StopRunningBackup(); // a backup copying it is stopped, not waited for; it tries again (spec 010 review S1)
             }
 
             if (open is not null)
@@ -927,6 +937,7 @@ internal sealed class StoreEngine : IDisposable
             }
 
             var handle = Publish(store, id, name, _records[id].Uid, instance, context, incarnation);
+            handle.Slot.HandedOut = true;
             if (_logger is not null)
             {
                 CrystalLog.DatabaseCreated(_logger, name, id);
@@ -949,12 +960,14 @@ internal sealed class StoreEngine : IDisposable
                 throw new DatabaseNotFoundException(name, $"Database '{name}' was not found or has been dropped (R5.2).");
             }
 
-            if (_open.TryGetValue(id, out var slot))
+            // Marked under the gate: a backup that opened this database closes it only if nobody took its handle (spec 010 R3.3).
+            if (!_open.TryGetValue(id, out var slot))
             {
-                return slot.Handle;
+                slot = OpenSlotLocked(store, id, name);
             }
 
-            return OpenSlotLocked(store, id, name).Handle;
+            slot.HandedOut = true;
+            return slot.Handle;
         }
     }
 
@@ -1139,7 +1152,12 @@ internal sealed class StoreEngine : IDisposable
                     continue;
                 }
 
-                return _open.TryGetValue(id, out var slot) ? slot : OpenSlotLocked(store, id, record.Name);
+                var slot = _open.TryGetValue(id, out var open) ? open : OpenSlotLocked(store, id, record.Name);
+
+                // Replication holds it now (a standby's follower writes into it without entering it): a backup that opened
+                // it must not close it under that holder (spec 010 review B1).
+                slot.HandedOut = true;
+                return slot;
             }
 
             return null;
@@ -1264,10 +1282,11 @@ internal sealed class StoreEngine : IDisposable
         ArgumentNullException.ThrowIfNull(database);
 
         DatabaseSlot slot;
+        DatabaseRecord record;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var record = ResolveLive(database, "dropped");
+            record = ResolveLive(database, "dropped");
             slot = _open[database.Id];
 
             // Step 1 (R5.6, R8.2): the registry batch, before anything is closed or deleted.
@@ -1295,11 +1314,25 @@ internal sealed class StoreEngine : IDisposable
         {
             Hook("drop.registered");
 
+            // A backup copying this database is stopped, not waited for (spec 010 R3.2); it records it as omitted.
+            slot.StopRunningBackup();
+
             // Steps 2–4: wait for calls in progress, close, delete the folder.
             slot.WaitForCallsInProgress(_logger);
             Hook("drop.drained");
             slot.Close();
             Hook("drop.closed");
+
+            // Under the gate, and only if no live database has the UID again (review S3): a restore may have registered
+            // it while this drop drained, and its records are its own.
+            lock (_gate)
+            {
+                if (!_records.Values.Any(r => r.State == LiveState && string.Equals(r.Uid, record.Uid, StringComparison.Ordinal)))
+                {
+                    ForgetReplicationRecords(record.Uid);
+                }
+            }
+
             TryDeleteDroppedFolder(DatabasePath(database.Id));
             if (_logger is not null)
             {
@@ -1339,6 +1372,7 @@ internal sealed class StoreEngine : IDisposable
             foreach (var slot in slots)
             {
                 slot.BeginClose(dropped: false);
+                slot.StopRunningBackup(); // spec 010 design § 5: a close stops a copy rather than waiting for it
             }
 
             // A drop in progress owns its slot; let it finish before the shared resources go.
@@ -1437,6 +1471,12 @@ internal sealed class StoreEngine : IDisposable
 
     /// <summary>The store's time provider (spec 004 R2.6), for replication's held-reader timing (spec 003 T7).</summary>
     internal TimeProvider Clock => _clock;
+
+    /// <summary>The store's instruments (spec 007), null until the engine is open.</summary>
+    internal CrystalMetrics? Metrics => _metrics;
+
+    /// <summary>The store's logger, null when it logs nothing.</summary>
+    internal ILogger? Logger => _logger;
 
     private DatabaseContext NewDatabaseContext(RocksInstance instance, string name, uint id) =>
         new(instance, _clock, DatabaseLabel(name, id), _options.Durability, _logger, StartSyncTimer, _metrics, _options.SlowCommitThreshold);
@@ -1920,10 +1960,261 @@ internal sealed class StoreEngine : IDisposable
 
     private void Hook(string step) => _options.Hook?.Invoke(step);
 
+    /// <summary>
+    /// Removes a dropped database's replication records, durably (spec 010 R11.1): its follow record, incarnation record
+    /// and resync marker. Left behind, they would describe a history to a database restored later under the same UID,
+    /// and a promotion would claim it. Best effort: a record that cannot be removed now is removed at the next open.
+    /// </summary>
+    internal void ForgetReplicationRecords(string uid, bool strict = false)
+    {
+        foreach (var path in new[]
+        {
+            FollowRecord.PathFor(_dataDirectory, uid),
+            Path.Combine(IncarnationRecord.Directory(_dataDirectory), uid + ".json"),
+            Path.Combine(ResyncMarker.Directory(_dataDirectory), uid),
+        })
+        {
+            try
+            {
+                DurableFile.Delete(path);
+            }
+            catch (Exception ex) when (!strict && ex is IOException or UnauthorizedAccessException)
+            {
+                // Removed at the next open, from the dropped record (RunStartupRecovery).
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ backup (spec 010)
+
+    /// <summary>The prefix of a restore's staging folder in the data directory; startup recovery deletes one left by a crash.</summary>
+    internal const string RestoreStagingPrefix = "restore-";
+
+    /// <summary>A live database as a backup set records it (spec 010 R3.1).</summary>
+    internal readonly record struct BackupMember(uint Id, string Name, string Uid, bool Replicated, long CreatedTicks);
+
+    /// <summary>The live databases at this moment, in id order, read under the store gate (spec 010 R3.1).</summary>
+    internal IReadOnlyList<BackupMember> LiveDatabasesForBackup()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return [.. _aliases
+                .Select(a => (Name: a.Key, Id: a.Value, Record: _records[a.Value]))
+                .Where(a => a.Record.State == LiveState)
+                .OrderBy(a => a.Id)
+                .Select(a => new BackupMember(a.Id, a.Name, a.Record.Uid, a.Record.Replicated, a.Record.CreatedTicks))];
+        }
+    }
+
+    /// <summary>
+    /// The slot of database <paramref name="id"/> for its backup, opened if closed (spec 010 R3.3), or null when it was
+    /// dropped meanwhile. <c>OpenedHere</c> says the backup opened it, so it closes it again after.
+    /// </summary>
+    internal (DatabaseSlot Slot, bool OpenedHere)? OpenForBackup(CrystalStore store, uint id)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_records.TryGetValue(id, out var record) || record.State != LiveState)
+            {
+                return null;
+            }
+
+            return _open.TryGetValue(id, out var slot) ? (slot, false) : (OpenSlotLocked(store, id, record.Name), true);
+        }
+    }
+
+    /// <summary>
+    /// Closes a database the backup opened (spec 010 R3.3), unless the product took its handle meanwhile or it is no
+    /// longer this store's open slot (dropped, closing).
+    /// </summary>
+    internal void CloseOpenedForBackup(DatabaseSlot slot)
+    {
+        lock (_gate)
+        {
+            if (_disposed || !_open.TryGetValue(slot.Id, out var open) || !ReferenceEquals(open, slot) || slot.HandedOut)
+            {
+                return;
+            }
+
+            // Closed under the gate (review S2): released before the instance is disposed, a concurrent open would find
+            // no slot and open a second instance on the same folder while this one still holds its lock. Nobody holds
+            // this slot but the backup, whose call has ended, so the wait is short.
+            _open.Remove(slot.Id);
+            PublishOpenSlots();
+            slot.BeginClose(dropped: false);
+            slot.WaitForCallsInProgress(_logger);
+            slot.Close();
+        }
+    }
+
+    // ------------------------------------------------------------------ restore (spec 010 design § 7)
+
+    /// <summary>A database a restore will register: its name here, its UID (new for a copy) and its replicated flag.</summary>
+    internal readonly record struct RestoreTarget(string Name, string Uid, bool Replicated);
+
+    /// <summary>A database a restore has put in place, ready to register.</summary>
+    internal readonly record struct RestoredDatabase(uint Id, string Name, string Uid, bool Replicated, long CreatedTicks);
+
+    /// <summary>
+    /// Step 4 (spec 010 design § 7): checks every name is free and every UID absent (R6.4), then advances the allocator
+    /// past one id per target in one synced registry write (005 addendum A2), before any folder exists. Returns the ids.
+    /// </summary>
+    internal uint[] AllocateForRestore(IReadOnlyList<RestoreTarget> targets)
+    {
+        foreach (var target in targets)
+        {
+            DatabaseNameRules.Validate(target.Name);
+        }
+
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            CheckRestoreTargetsLocked(targets);
+            if (_nextDatabaseId + (ulong)targets.Count - 1 > uint.MaxValue)
+            {
+                throw new InvalidOperationException("The store has issued every database id; ids are never reused (R4.3).");
+            }
+
+            var ids = new uint[targets.Count];
+            for (var i = 0; i < ids.Length; i++)
+            {
+                ids[i] = (uint)(_nextDatabaseId + (ulong)i);
+                if (Directory.Exists(DatabasePath(ids[i])))
+                {
+                    throw new IOException(
+                        $"The restore cannot use database id {ids[i]}: folder '{DatabasePath(ids[i])}' already exists and " +
+                        "Crystal did not create it. Crystal owns its data directory (R2.2); move it out, then restore again.");
+                }
+            }
+
+            var next = _nextDatabaseId + (ulong)targets.Count;
+            using (var allocation = new WriteBatch())
+            {
+                allocation.Put(RegistryKey(TagAllocator), UInt64Bytes(next), _registryDb.Family(RegistryFamily));
+                WriteRegistry(allocation);
+            }
+
+            _nextDatabaseId = next;
+            Hook("restore.allocated");
+            return ids;
+        }
+    }
+
+    /// <summary>A staging folder for one restored database, in the data directory so its move into place is a rename.</summary>
+    internal string RestoreStagingPath() => Path.Combine(_dataDirectory, RestoreStagingPrefix + Guid.NewGuid().ToString("N"));
+
+    /// <summary>
+    /// Opens a restored folder on its own and loads its catalogue expecting the database <paramref name="expectedUid"/>
+    /// (spec 009 R2.3; spec 010 R6.6, R11.6), before it is moved into place. For a copy (<paramref name="newUid"/> set)
+    /// rewrites its identity with the new UID (R6.5, R11.7). Returns the identity it now has.
+    /// </summary>
+    internal DatabaseIdentity CheckRestoredFolder(string staging, string expectedUid, string? newUid, string label)
+    {
+        var (walTtl, walSize) = WalRetentionFor(replicated: true);
+        using var instance = RocksInstance.Open(staging, _resources, EmptyFamilyProfiles, walTtl, walSize);
+        using var context = new DatabaseContext(instance, _clock, label);
+        var identity = context.LoadCatalogue(DatabaseKind.Database, expectedUid);
+        return newUid is null ? identity : context.ReplaceIdentityUid(identity, newUid);
+    }
+
+    /// <summary>Moves a checked staging folder into <c>db-{id}</c>, durably (spec 010 R11.5), and writes its name file.</summary>
+    internal void MoveRestoredIntoPlace(string staging, uint id, string name)
+    {
+        var dbPath = DatabasePath(id);
+        Directory.Move(staging, dbPath);
+        DurableFile.SyncDirectory(_dataDirectory);
+        WriteNameFile(dbPath, name);
+        Hook("restore.moved");
+    }
+
+    /// <summary>
+    /// Step 6 (spec 010 design § 7, R6.6): under the store gate, re-checks the names and UIDs, clears any replication
+    /// records of the restored UIDs (R11.2), then registers every restored database in one synced registry batch through
+    /// the generation path a create uses, so waiting pulls wake (R11.4). <paramref name="registering"/> turns true just
+    /// before the batch is written: from there a failure keeps the folders, since the write may be durable (005 A9).
+    /// </summary>
+    internal void RegisterRestored(IReadOnlyList<RestoredDatabase> restored, ref bool registering)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            CheckRestoreTargetsLocked([.. restored.Select(r => new RestoreTarget(r.Name, r.Uid, r.Replicated))]);
+            foreach (var database in restored)
+            {
+                ForgetReplicationRecords(database.Uid, strict: true);
+            }
+
+            var records = restored.Select(r => (r.Id, Record: new DatabaseRecord
+            {
+                Version = DatabaseRecord.CurrentVersion,
+                Name = r.Name,
+                Uid = r.Uid,
+                Replicated = r.Replicated,
+                State = LiveState,
+                CreatedTicks = r.CreatedTicks, // the database's own (spec 009 R2.3), read from its identity
+                DroppedTicks = null,
+            })).ToList();
+
+            var generation = _generation + 1;
+            using var batch = new WriteBatch();
+            var family = _registryDb.Family(RegistryFamily);
+            foreach (var (id, record) in records)
+            {
+                batch.Put(AliasKey(record.Name), UInt32Bytes(id), family);
+                batch.Put(RecordKey(id), DatabaseRecord.Serialize(record), family);
+            }
+
+            batch.Put(RegistryKey(TagGeneration), UInt64Bytes((ulong)generation), family);
+            Hook("restore.registering");
+            registering = true;
+            WriteRegistry(batch);
+
+            PublishGeneration(generation);
+            foreach (var (id, record) in records)
+            {
+                _aliases[record.Name] = id;
+                _records[id] = record;
+            }
+        }
+    }
+
+    /// <summary>Removes a restore's folder after a failure before its registration (spec 010 design § 7). Best effort.</summary>
+    internal void RemoveRestoredFolder(string path) => TryDeleteDirectory(path);
+
+    private void CheckRestoreTargetsLocked(IReadOnlyList<RestoreTarget> targets)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var uids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var target in targets)
+        {
+            if (_aliases.ContainsKey(target.Name) || !names.Add(target.Name))
+            {
+                throw new DatabaseNameTakenException(
+                    target.Name,
+                    $"Database '{target.Name}' already exists here, or the restore names it twice (spec 010 R6.4). Restore it " +
+                    "under another name (RestoreOptions.Rename), or drop the existing one first.");
+            }
+
+            var holder = _records.FirstOrDefault(r => r.Value.State == LiveState && string.Equals(r.Value.Uid, target.Uid, StringComparison.Ordinal));
+            if (holder.Value is not null || !uids.Add(target.Uid))
+            {
+                var existing = holder.Value?.Name ?? target.Name;
+                throw new DatabaseUidTakenException(
+                    target.Uid,
+                    existing,
+                    $"The store already has database {target.Uid} (as '{existing}'), the one the restore would bring in as " +
+                    $"'{target.Name}' (spec 010 R6.4). Drop the existing one first, or restore it as a copy " +
+                    "(RestoreOptions.NewIdentity).");
+            }
+        }
+    }
+
     /// <summary>Runs the test hook at a named step of replication (design addendum A8); no-op in production.</summary>
     internal void RunHook(string step) => Hook(step);
 
-    private string DatabasePath(uint id) => Path.Combine(_dataDirectory, DatabaseFolderName(id));
+    internal string DatabasePath(uint id) => Path.Combine(_dataDirectory, DatabaseFolderName(id));
 
     internal static string DatabaseFolderName(uint id) => $"db-{id:x8}";
 

@@ -140,6 +140,9 @@ internal sealed class TestNode : IDisposable
     /// <summary>Schedule a rejoin of <paramref name="primary"/> on the next start (spec 003 R7.8).</summary>
     public void ScheduleRejoin(TestNode primary) => Send("rejoin", ("endpoint", $"127.0.0.1:{primary.Port}"));
 
+    /// <summary>Backs up every database of the node into <paramref name="root"/> (spec 010); returns the set's id.</summary>
+    public string Backup(string root) => Send("backup", ("root", root))!.GetValue<string>();
+
     /// <summary>This node's replication role.</summary>
     public string Role() => Send("role")!.GetValue<string>();
 

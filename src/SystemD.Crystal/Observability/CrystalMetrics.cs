@@ -42,6 +42,11 @@ internal sealed class CrystalMetrics : IDisposable
     private readonly Histogram<double> _lockWait;
     private readonly Counter<long> _lockAll;
     private readonly Histogram<long> _scanSteps;
+    private readonly Histogram<double> _backupDuration;
+    private readonly Counter<long> _backupBytes;
+    private readonly Counter<long> _backupFiles;
+    private readonly Counter<long> _backupFailures;
+    private long _backupLastSuccess; // Unix seconds of the last complete set; 0 before the first (spec 010 R7.2)
 
     /// <param name="factory">The host's meter factory, or null for a meter of the store's own (R1.1).</param>
     /// <param name="nodeId">The store's node id: a tag on the meter, so two stores in one process are two series.</param>
@@ -93,6 +98,15 @@ internal sealed class CrystalMetrics : IDisposable
             "LockAll calls: a product re-planning under a moving lock set shows here.");
         _scanSteps = _meter.CreateHistogram<long>("crystal.scan.steps", "{step}",
             "Native iterator steps per scan: steps growing while results do not is tombstones at the head of a range.");
+
+        // Spec 010 R7.2: backups. Bytes and files are what was copied, not what was shared with earlier backups.
+        _backupDuration = _meter.CreateHistogram<double>("crystal.backup.duration", "s", "Duration of each complete backup.");
+        _backupBytes = _meter.CreateCounter<long>("crystal.backup.bytes", "By", "Bytes backups copied: new files only, not those shared with earlier backups.");
+        _backupFiles = _meter.CreateCounter<long>("crystal.backup.files", "{file}", "Files backups copied: new files only.");
+        _backupFailures = _meter.CreateCounter<long>("crystal.backup.failures", "{backup}", "Backups that failed or were cancelled; none wrote a set.");
+        _meter.CreateObservableGauge("crystal.backup.last_success",
+            () => Interlocked.Read(ref _backupLastSuccess) is var at && at != 0 ? Single(at) : [],
+            "s", "Unix time in seconds of the last complete backup set; absent before the first.");
 
         _meter.CreateObservableGauge("crystal.storage.memtable.deletes",
             () => Sum(i => StorageGauges.Sum(i, "rocksdb.num-deletes-active-mem-table") + StorageGauges.Sum(i, "rocksdb.num-deletes-imm-mem-tables")),
@@ -166,6 +180,18 @@ internal sealed class CrystalMetrics : IDisposable
     public void LockAll() => _lockAll.Add(1);
 
     public void Scan(long steps) => _scanSteps.Record(steps);
+
+    /// <summary>Records a complete backup (spec 010 R7.2).</summary>
+    public void BackupCompleted(long start, long bytes, long files, DateTimeOffset completed)
+    {
+        _backupDuration.Record(_clock.GetElapsedTime(start).TotalSeconds);
+        _backupBytes.Add(bytes);
+        _backupFiles.Add(files);
+        Interlocked.Exchange(ref _backupLastSuccess, completed.ToUnixTimeSeconds());
+    }
+
+    /// <summary>Records a backup that failed or was cancelled (spec 010 R7.2).</summary>
+    public void BackupFailed() => _backupFailures.Add(1);
 
     private static KeyValuePair<string, object?> Tag(DurabilityMode durability) => durability switch
     {

@@ -45,7 +45,13 @@ internal static class CrashHost
     /// Runs the host with <paramref name="args"/>. If it prints <c>AT {step}</c>, kills the whole process there and
     /// returns the step; otherwise returns its last line once it exits.
     /// </summary>
-    public static string RunAndKillAtStep(params string[] args)
+    public static string RunAndKillAtStep(params string[] args) => RunAndKillAfter(TimeSpan.Zero, args);
+
+    /// <summary>
+    /// As <see cref="RunAndKillAtStep"/>, but kills <paramref name="delay"/> after the host prints <c>AT {step}</c>: with a
+    /// step ending in <c>+run</c> the host carries on past it, so the kill lands in what follows (spec 010 R9.4).
+    /// </summary>
+    public static string RunAndKillAfter(TimeSpan delay, params string[] args)
     {
         using var process = Start(args);
         var lines = new List<string>();
@@ -54,6 +60,8 @@ internal static class CrashHost
             lines.Add(line);
             if (line.StartsWith("AT ", StringComparison.Ordinal))
             {
+                Thread.Sleep(delay);
+                Assert.False(process.HasExited, "The crash host finished before it was killed.");
                 process.Kill(entireProcessTree: true);
                 Assert.True(process.WaitForExit(Patience), "The crash host did not die when killed.");
                 return line[3..];

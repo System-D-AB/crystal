@@ -252,3 +252,103 @@ public sealed class BoxDroppedException : Exception
     }
 }
 
+
+/// <summary>
+/// Thrown when a backup destination or root cannot be used (spec 010 R2.1, R2.2): not an absolute path, inside the
+/// store's data directory or containing it, or a non-empty folder that is not a backup root.
+/// </summary>
+public sealed class BackupDestinationException : Exception
+{
+    /// <summary>The destination as the caller named it.</summary>
+    public string Destination { get; }
+
+    /// <summary>Initializes a new instance of <see cref="BackupDestinationException"/>.</summary>
+    public BackupDestinationException(string destination, string message)
+        : base(message)
+    {
+        Destination = destination;
+    }
+}
+
+/// <summary>
+/// Thrown when a backup root is held by another backup, verify, purge or restore, in this process or another
+/// (spec 010 R2.4). Operations on a root are refused at once, never queued.
+/// </summary>
+public sealed class BackupRootLockedException : Exception
+{
+    /// <summary>The backup root's path.</summary>
+    public string RootPath { get; }
+
+    /// <summary>Initializes a new instance of <see cref="BackupRootLockedException"/>.</summary>
+    public BackupRootLockedException(string rootPath, string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+        RootPath = rootPath;
+    }
+}
+
+/// <summary>Thrown when a store is asked for a backup while one is running (spec 010 R1.6).</summary>
+public sealed class BackupInProgressException : Exception
+{
+    /// <summary>The destination of the backup that is running.</summary>
+    public string RunningDestination { get; }
+
+    /// <summary>Initializes a new instance of <see cref="BackupInProgressException"/>.</summary>
+    public BackupInProgressException(string runningDestination, string message)
+        : base(message)
+    {
+        RunningDestination = runningDestination;
+    }
+}
+
+/// <summary>Thrown when a backup root holds no set by the given id (spec 010 R9.8).</summary>
+public sealed class BackupSetNotFoundException : Exception
+{
+    /// <summary>The set id asked for.</summary>
+    public string SetId { get; }
+
+    /// <summary>Initializes a new instance of <see cref="BackupSetNotFoundException"/>.</summary>
+    public BackupSetNotFoundException(string setId, string message)
+        : base(message)
+    {
+        SetId = setId;
+    }
+}
+
+/// <summary>
+/// Thrown when a backup manifest or root file is damaged (spec 010 R4.2): unreadable, of another format, or failing its
+/// checksum. A damaged manifest is never used.
+/// </summary>
+public sealed class BackupDamagedException : Exception
+{
+    /// <summary>The damaged file.</summary>
+    public string Path { get; }
+
+    /// <summary>Initializes a new instance of <see cref="BackupDamagedException"/>.</summary>
+    public BackupDamagedException(string path, string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+        Path = path;
+    }
+}
+
+/// <summary>
+/// Thrown when a restore would bring in a database whose UID the store already has (spec 010 R6.4). Drop the existing
+/// one first, or restore as a copy with <see cref="RestoreOptions.NewIdentity"/>.
+/// </summary>
+public sealed class DatabaseUidTakenException : Exception
+{
+    /// <summary>The UID that is taken.</summary>
+    public string Uid { get; }
+
+    /// <summary>The name of the database that has it in this store.</summary>
+    public string ExistingName { get; }
+
+    /// <summary>Initializes a new instance of <see cref="DatabaseUidTakenException"/>.</summary>
+    public DatabaseUidTakenException(string uid, string existingName, string message)
+        : base(message)
+    {
+        Uid = uid;
+        ExistingName = existingName;
+    }
+}

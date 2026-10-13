@@ -23,6 +23,36 @@ public sealed class BindingSurfaceTests
     [
         "rocksdb_options_add_compact_on_deletion_collector_factory_del_ratio",
         "rocksdb_options_set_memtable_op_scan_flush_trigger",
+        "rocksdb_backup_engine_options_create", // spec 010
+        "rocksdb_backup_engine_options_set_share_table_files", // spec 010
+        "rocksdb_backup_engine_options_set_share_files_with_checksum", // spec 010
+        "rocksdb_backup_engine_options_set_sync", // spec 010
+        "rocksdb_backup_engine_options_set_backup_log_files", // spec 010
+        "rocksdb_backup_engine_options_set_max_background_operations", // spec 010
+        "rocksdb_backup_engine_options_set_backup_rate_limit", // spec 010
+        "rocksdb_backup_engine_open_opts", // spec 010
+        "rocksdb_backup_engine_options_destroy", // spec 010
+        "rocksdb_create_backup_options_create", // spec 010
+        "rocksdb_create_backup_options_set_flush_before_backup", // spec 010
+        "rocksdb_create_backup_options_destroy", // spec 010
+        "rocksdb_backup_engine_create_new_backup_with_metadata", // spec 010
+        "rocksdb_backup_engine_stop_backup", // spec 010
+        "rocksdb_backup_engine_get_backup_info", // spec 010
+        "rocksdb_backup_engine_info_count", // spec 010
+        "rocksdb_backup_engine_info_backup_id", // spec 010
+        "rocksdb_backup_engine_info_timestamp", // spec 010
+        "rocksdb_backup_engine_info_size", // spec 010
+        "rocksdb_backup_engine_info_number_files", // spec 010
+        "rocksdb_backup_engine_info_app_metadata", // spec 010
+        "rocksdb_backup_engine_info_destroy", // spec 010
+        "rocksdb_backup_engine_verify_backup", // spec 010
+        "rocksdb_backup_engine_purge_old_backups", // spec 010
+        "rocksdb_restore_options_create", // spec 010
+        "rocksdb_restore_options_set_keep_log_files", // spec 010
+        "rocksdb_backup_engine_restore_db_from_backup", // spec 010
+        "rocksdb_restore_options_destroy", // spec 010
+        "rocksdb_backup_engine_close", // spec 010
+        "rocksdb_verify_checksum", // spec 010
         "rocksdb_options_set_memtable_avg_op_scan_flush_trigger",
         "rocksdb_approximate_sizes_cf_with_options",
         "rocksdb_size_approximation_options_create",
@@ -42,6 +72,7 @@ public sealed class BindingSurfaceTests
     private static readonly (string Type, string Member)[] ManagedMembers =
     [
         ("RocksDbSharp.RocksDb", "Open"),
+        ("RocksDbSharp.RocksDb", "OpenReadOnly"), // spec 010 deep verify
         ("RocksDbSharp.RocksDb", "Get"),
         ("RocksDbSharp.RocksDb", "Write"),
         ("RocksDbSharp.RocksDb", "CreateSnapshot"),

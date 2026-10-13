@@ -15,10 +15,14 @@ namespace SystemD.Crystal.CrashHost;
 /// rename  {dir} {name} {newName} {step} rename a database
 /// install {dir} {name} {uid} {snapshot} {step} install a downloaded snapshot as a new replicated database (spec 011 R9)
 /// reset   {dir} {step}                  reset the store
+/// backup  {dir} {root} {step}           back up every database into the root, copying at 1 MB/s (spec 010 R9.4)
+/// restore {dir} {root} {setId} {step}   restore a backup set (spec 010 R9.9)
 /// hold    {dir}                         open the store, print OPEN, close it when stdin closes
 /// tryopen {dir}                         print LOCKED or OPENED
+/// holdroot {root}                       open a backup root, print HELD, release it when stdin closes (spec 010 R2.4)
 /// </code>
-/// A step of <c>none</c> runs to completion and prints <c>DONE</c>.
+/// A step of <c>none</c> runs to completion and prints <c>DONE</c>. A step ending in <c>+run</c> prints <c>AT</c> at the
+/// step without stopping there, so the test kills the process at a moment after it (a backup's native copy).
 /// </remarks>
 internal static class Program
 {
@@ -33,6 +37,14 @@ internal static class Program
             {
                 using var store = CrystalStore.Open(dir);
                 Say("OPEN");
+                Console.In.ReadToEnd();
+                return 0;
+            }
+
+            case "holdroot":
+            {
+                using var root = CrystalBackupRoot.Open(dir);
+                Say("HELD");
                 Console.In.ReadToEnd();
                 return 0;
             }
@@ -76,6 +88,12 @@ internal static class Program
                 case "install":
                     store.Engine.InstallBootstrap(store, args[3], args[2], args[4]);
                     break;
+                case "backup":
+                    Say("SET " + store.BackupAsync(args[2], new BackupOptions { RateLimitBytesPerSecond = 1 << 20 }).GetAwaiter().GetResult().SetId);
+                    break;
+                case "restore":
+                    store.RestoreAsync(args[2], args[3]).GetAwaiter().GetResult();
+                    break;
                 default:
                     throw new ArgumentException($"Unknown command '{command}'.");
             }
@@ -85,8 +103,20 @@ internal static class Program
         return 0;
     }
 
+    private static int _passed;
+
     private static void StopIfAt(string step, string stopAt)
     {
+        if (stopAt.EndsWith("+run", StringComparison.Ordinal))
+        {
+            if (string.Equals(step, stopAt[..^"+run".Length], StringComparison.Ordinal) && Interlocked.Exchange(ref _passed, 1) == 0)
+            {
+                Say("AT " + step); // and carry on: the test kills the process during what follows
+            }
+
+            return;
+        }
+
         if (string.Equals(step, stopAt, StringComparison.Ordinal))
         {
             Say("AT " + step);

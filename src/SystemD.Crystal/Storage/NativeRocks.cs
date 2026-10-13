@@ -22,6 +22,9 @@ namespace SystemD.Crystal.Storage;
 /// </summary>
 internal static class NativeRocks
 {
+    /// <summary>The RocksDB version of the pinned binding package, recorded in each backup set (spec 010 R4.2).</summary>
+    internal const string RocksDbVersion = "11.8.1";
+
     private static Native N => Native.Instance;
 
     /// <summary>
@@ -262,6 +265,167 @@ internal static class NativeRocks
         if (manager != IntPtr.Zero)
         {
             N.rocksdb_write_buffer_manager_destroy(manager);
+        }
+    }
+
+    // ------------------------------------------------------------------ BackupEngine (spec 010 design § 3)
+
+    /// <summary>
+    /// Opens a RocksDB <c>BackupEngine</c> on <paramref name="directory"/> (created if missing): table files shared and
+    /// named by their checksum, every file synced, no WAL copied (the backup flushes first), at most
+    /// <paramref name="backgroundOperations"/> copy threads and <paramref name="rateLimitBytesPerSecond"/> (0: none).
+    /// An interrupted backup left in the directory is cleaned up here. The engine is freed with
+    /// <see cref="BackupEngineClose"/>. Synchronous native work.
+    /// </summary>
+    internal static IntPtr BackupEngineOpen(string directory, Env env, int backgroundOperations, ulong rateLimitBytesPerSecond)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(directory);
+        ArgumentNullException.ThrowIfNull(env);
+        var options = N.rocksdb_backup_engine_options_create(directory);
+        try
+        {
+            N.rocksdb_backup_engine_options_set_share_table_files(options, 1);
+            N.rocksdb_backup_engine_options_set_share_files_with_checksum(options, 1);
+            N.rocksdb_backup_engine_options_set_sync(options, 1);
+            N.rocksdb_backup_engine_options_set_backup_log_files(options, 0);
+            N.rocksdb_backup_engine_options_set_max_background_operations(options, Math.Max(1, backgroundOperations));
+            N.rocksdb_backup_engine_options_set_backup_rate_limit(options, rateLimitBytesPerSecond);
+            var engine = N.rocksdb_backup_engine_open_opts(options, env.Handle, out var error);
+            RocksException.ThrowIfError(error);
+            return engine;
+        }
+        finally
+        {
+            N.rocksdb_backup_engine_options_destroy(options);
+            GC.KeepAlive(env);
+        }
+    }
+
+    /// <summary>
+    /// Backs <paramref name="db"/> up into <paramref name="engine"/>, flushing its memtables first (so every
+    /// acknowledged commit is in it, whatever its durability), with <paramref name="metadata"/> as the backup's
+    /// application metadata. Returns the new backup's id. Synchronous native work; <see cref="BackupStop"/> from another
+    /// thread makes it fail promptly.
+    /// </summary>
+    internal static unsafe uint BackupCreate(IntPtr engine, RocksDb db, byte[] metadata)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(metadata);
+        var options = N.rocksdb_create_backup_options_create();
+        try
+        {
+            N.rocksdb_create_backup_options_set_flush_before_backup(options, 1);
+            uint id = 0;
+            fixed (byte* data = metadata)
+            {
+                N.rocksdb_backup_engine_create_new_backup_with_metadata(
+                    engine, db.Handle, options, (IntPtr)data, (UIntPtr)metadata.Length, (IntPtr)(&id), out var error);
+                RocksException.ThrowIfError(error);
+            }
+
+            return id;
+        }
+        finally
+        {
+            N.rocksdb_create_backup_options_destroy(options);
+            GC.KeepAlive(db);
+        }
+    }
+
+    /// <summary>Asks a running backup on <paramref name="engine"/> to stop; it then fails. The engine takes no further backups.</summary>
+    internal static void BackupStop(IntPtr engine) => N.rocksdb_backup_engine_stop_backup(engine);
+
+    /// <summary>One backup an engine holds: its id, creation time (Unix seconds), size, file count and application metadata.</summary>
+    internal readonly record struct BackupEntry(uint Id, long Timestamp, ulong Size, uint Files, byte[] Metadata);
+
+    /// <summary>The backups <paramref name="engine"/> holds, oldest first. Synchronous native work.</summary>
+    internal static BackupEntry[] BackupList(IntPtr engine)
+    {
+        var info = N.rocksdb_backup_engine_get_backup_info(engine);
+        try
+        {
+            var count = N.rocksdb_backup_engine_info_count(info);
+            var entries = new BackupEntry[count];
+            for (var i = 0; i < count; i++)
+            {
+                var metadata = N.rocksdb_backup_engine_info_app_metadata(info, i, out var length);
+                var bytes = new byte[(int)length];
+                if (metadata != IntPtr.Zero && bytes.Length > 0)
+                {
+                    Marshal.Copy(metadata, bytes, 0, bytes.Length); // owned by the info, copied before it is freed
+                }
+
+                entries[i] = new BackupEntry(
+                    N.rocksdb_backup_engine_info_backup_id(info, i),
+                    N.rocksdb_backup_engine_info_timestamp(info, i),
+                    N.rocksdb_backup_engine_info_size(info, i),
+                    N.rocksdb_backup_engine_info_number_files(info, i),
+                    bytes);
+            }
+
+            return entries;
+        }
+        finally
+        {
+            N.rocksdb_backup_engine_info_destroy(info);
+        }
+    }
+
+    /// <summary>
+    /// Checks that every file of backup <paramref name="backupId"/> is present at its recorded size (the C API does not
+    /// read their contents). Throws <see cref="RocksException"/> otherwise. Synchronous native work.
+    /// </summary>
+    internal static void BackupVerify(IntPtr engine, uint backupId)
+    {
+        N.rocksdb_backup_engine_verify_backup(engine, backupId, out var error);
+        RocksException.ThrowIfError(error);
+    }
+
+    /// <summary>Deletes all but the newest <paramref name="keep"/> backups of <paramref name="engine"/>. Synchronous native work.</summary>
+    internal static void BackupPurge(IntPtr engine, uint keep)
+    {
+        N.rocksdb_backup_engine_purge_old_backups(engine, keep, out var error);
+        RocksException.ThrowIfError(error);
+    }
+
+    /// <summary>Restores backup <paramref name="backupId"/> into <paramref name="directory"/>, its WAL folder the same. Synchronous native work.</summary>
+    internal static void BackupRestore(IntPtr engine, uint backupId, string directory)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(directory);
+        var options = N.rocksdb_restore_options_create();
+        try
+        {
+            N.rocksdb_restore_options_set_keep_log_files(options, 0);
+            N.rocksdb_backup_engine_restore_db_from_backup(engine, directory, directory, options, backupId, out var error);
+            RocksException.ThrowIfError(error);
+        }
+        finally
+        {
+            N.rocksdb_restore_options_destroy(options);
+        }
+    }
+
+    /// <summary>Closes an engine opened by <see cref="BackupEngineOpen"/>.</summary>
+    internal static void BackupEngineClose(IntPtr engine)
+    {
+        if (engine != IntPtr.Zero)
+        {
+            N.rocksdb_backup_engine_close(engine);
+        }
+    }
+
+    /// <summary>Reads every table file of <paramref name="db"/> and checks its block checksums (deep verify). Synchronous native work.</summary>
+    internal static void VerifyChecksums(RocksDb db)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        try
+        {
+            N.rocksdb_verify_checksum(db.Handle, out var error);
+            RocksException.ThrowIfError(error);
+        }
+        finally
+        {
+            GC.KeepAlive(db);
         }
     }
 }

@@ -102,6 +102,34 @@ internal sealed class RocksInstance : IDisposable
         return new RocksInstance(db, handles);
     }
 
+    /// <summary>
+    /// Opens the database at <paramref name="path"/> read-only, with the fixed family order (spec 010 deep verify): a
+    /// restored backup is checked without anything being written to it. Synchronous native work.
+    /// </summary>
+    internal static RocksInstance OpenReadOnly(string path, StoreResources resources, IReadOnlyDictionary<string, BoxProfile> familyProfiles)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentNullException.ThrowIfNull(resources);
+        ArgumentNullException.ThrowIfNull(familyProfiles);
+
+        var dbOptions = new DbOptions();
+        resources.ApplyTo(dbOptions);
+        var families = new ColumnFamilies(ProfileOptions.For(ProfileOf("default", familyProfiles)));
+        foreach (var name in FamilyOrder.Skip(1))
+        {
+            families.Add(name, ProfileOptions.For(ProfileOf(name, familyProfiles)));
+        }
+
+        var db = RocksDb.OpenReadOnly(dbOptions, path, families, errIfLogFileExists: false);
+        var handles = new Dictionary<string, ColumnFamilyHandle>(StringComparer.Ordinal);
+        foreach (var name in FamilyOrder)
+        {
+            handles[name] = db.GetColumnFamily(name);
+        }
+
+        return new RocksInstance(db, handles);
+    }
+
     private static BoxProfile ProfileOf(string family, IReadOnlyDictionary<string, BoxProfile> profiles) =>
         family switch
         {
