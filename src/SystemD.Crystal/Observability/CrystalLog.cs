@@ -164,6 +164,14 @@ internal static partial class CrystalLog
         Message = "Replication: two primaries at epoch {Epoch}; the product must resolve it. {Detail}")]
     public static partial void ReplicationConflict(ILogger logger, long epoch, string detail);
 
+    [LoggerMessage(EventId = 2013, EventName = nameof(CrystalLogEvents.ReplicationPromotedWithPendingResync), Level = LogLevel.Warning,
+        Message = "Replication: promoted at epoch {Epoch} with databases marked for re-bootstrap. {Detail}")]
+    public static partial void ReplicationPromotedWithPendingResync(ILogger logger, long epoch, string detail);
+
+    [LoggerMessage(EventId = 2014, EventName = nameof(CrystalLogEvents.ReplicationEventHandlerFailed), Level = LogLevel.Error,
+        Message = "Replication: a handler of the {Kind} event threw; later events are still delivered.")]
+    public static partial void ReplicationEventHandlerFailed(ILogger logger, string kind, Exception exception);
+
     [LoggerMessage(EventId = 2011, EventName = nameof(CrystalLogEvents.ReplicationConnected), Level = LogLevel.Information,
         Message = "Replication: connected at epoch {Epoch}. {Detail}")]
     public static partial void ReplicationConnected(ILogger logger, long epoch, string detail);

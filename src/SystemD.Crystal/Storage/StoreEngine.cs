@@ -117,6 +117,9 @@ internal sealed class StoreEngine : IDisposable
     /// <summary>The store's default durability, for the store's closing event.</summary>
     internal DurabilityMode Durability => _options.Durability;
 
+    /// <summary>The most databases this store opens at once (sizes the replication request cap, spec 011 R4.2).</summary>
+    internal int MaxOpenDatabases => _options.MaxOpenDatabases;
+
     /// <summary>The registry generation (R4.2). Read without the store gate.</summary>
     public long RegistryGeneration => Interlocked.Read(ref _generation);
 
@@ -578,6 +581,7 @@ internal sealed class StoreEngine : IDisposable
                 if (!Directory.Exists(dbPath))
                 {
                     Directory.Move(entry, dbPath); // the install crashed between its moves: the old content comes back
+                    DurableFile.SyncDirectory(_dataDirectory); // spec 011 R9.1
                 }
                 else
                 {
@@ -734,23 +738,48 @@ internal sealed class StoreEngine : IDisposable
             // what was moved aside. If the snapshot cannot be moved in, the old content goes back. A crash between the
             // two moves leaves the old content beside an empty place, which startup recovery puts back. Same
             // filesystem (the download is a sibling), so each move is a rename.
+            // A new UID advances the allocator before its folder is moved in, as a create does (spec 011 R9.2): a crash
+            // after the move then leaves a folder below the allocator with no record, which startup recovery removes,
+            // never a folder at the next id that blocks every later create.
+            if (existingId is null)
+            {
+                using (var allocation = new WriteBatch())
+                {
+                    allocation.Put(RegistryKey(TagAllocator), UInt64Bytes((ulong)id + 1), _registryDb.Family(RegistryFamily));
+                    WriteRegistry(allocation);
+                }
+
+                _nextDatabaseId = (ulong)id + 1;
+                Hook("install.allocated");
+            }
+
+            // Whatever this node followed for the database before no longer describes what it will hold (spec 011
+            // R2.2): the record goes before the folder moves, and the caller writes the snapshot's after. A crash in
+            // between leaves no record, which knows nothing shared (003 R5.5): never a promotion that claims the old
+            // log's history for the snapshot's data.
+            FollowRecord.DeleteDurably(_dataDirectory, uid);
+
             string? aside = null;
             if (Directory.Exists(dbPath))
             {
                 aside = dbPath + ReplacedSuffix + Guid.NewGuid().ToString("N");
                 Directory.Move(dbPath, aside);
+                DurableFile.SyncDirectory(_dataDirectory); // spec 011 R9.1
             }
 
             try
             {
                 Hook("install.aside");
                 Directory.Move(bootstrapDirectory, dbPath);
+                DurableFile.SyncDirectory(_dataDirectory); // spec 011 R9.1
+                Hook("install.moved");
             }
             catch
             {
                 if (aside is not null && !Directory.Exists(dbPath))
                 {
                     Directory.Move(aside, dbPath);
+                    DurableFile.SyncDirectory(_dataDirectory);
                 }
 
                 throw;
@@ -763,17 +792,9 @@ internal sealed class StoreEngine : IDisposable
 
             WriteNameFile(dbPath, name);
 
-            // Register the record for a new UID (allocator first, as a create does).
+            // Register the record for a new UID (its allocator was advanced before the move, above).
             if (existingId is null)
             {
-                using (var allocation = new WriteBatch())
-                {
-                    allocation.Put(RegistryKey(TagAllocator), UInt64Bytes((ulong)id + 1), _registryDb.Family(RegistryFamily));
-                    WriteRegistry(allocation);
-                }
-
-                _nextDatabaseId = (ulong)id + 1;
-
                 var record = new DatabaseRecord
                 {
                     Version = DatabaseRecord.CurrentVersion,
@@ -792,7 +813,7 @@ internal sealed class StoreEngine : IDisposable
                 batch.Put(RegistryKey(TagGeneration), UInt64Bytes((ulong)generation), family);
                 WriteRegistry(batch);
 
-                Interlocked.Exchange(ref _generation, generation);
+                PublishGeneration(generation);
                 _aliases[name] = id;
                 _records[id] = record;
             }
@@ -886,7 +907,7 @@ internal sealed class StoreEngine : IDisposable
                 registering = true;
                 WriteRegistry(batch);
 
-                Interlocked.Exchange(ref _generation, generation);
+                PublishGeneration(generation);
                 _aliases[name] = id;
                 _records[id] = record;
             }
@@ -1083,6 +1104,19 @@ internal sealed class StoreEngine : IDisposable
     internal long ReplicatedSetVersion => RegistryGeneration;
 
     /// <summary>
+    /// Raised after every change of the registry's generation (a database created, dropped, renamed, swapped or
+    /// installed): the replicated set may have changed, so a primary wakes its waiting pulls (spec 011 R11.1, 003 R3.4).
+    /// Raised under the store gate: a handler must be quick and must not call back into the engine.
+    /// </summary>
+    internal event Action? RegistryChanged;
+
+    private void PublishGeneration(long generation)
+    {
+        Interlocked.Exchange(ref _generation, generation);
+        RegistryChanged?.Invoke();
+    }
+
+    /// <summary>
     /// The slot of the live, replicated database with <paramref name="uid"/>, opening it if needed (spec 003 T7). A
     /// pull names databases by UID, and a replicated database that no standby has touched may still be closed; the
     /// primary opens it to read its WAL and latest position. Returns null when no live replicated database has that
@@ -1160,7 +1194,7 @@ internal sealed class StoreEngine : IDisposable
             batch.Put(RegistryKey(TagGeneration), UInt64Bytes((ulong)generation), family);
             WriteRegistry(batch);
 
-            Interlocked.Exchange(ref _generation, generation);
+            PublishGeneration(generation);
             _aliases.Remove(record.Name);
             _aliases[newName] = database.Id;
             _records[database.Id] = updated;
@@ -1207,7 +1241,7 @@ internal sealed class StoreEngine : IDisposable
             batch.Put(RegistryKey(TagGeneration), UInt64Bytes((ulong)generation), family);
             WriteRegistry(batch);
 
-            Interlocked.Exchange(ref _generation, generation);
+            PublishGeneration(generation);
             _aliases[name1] = second.Id;
             _aliases[name2] = first.Id;
             _records[first.Id] = updated1;
@@ -1246,7 +1280,7 @@ internal sealed class StoreEngine : IDisposable
             batch.Put(RegistryKey(TagGeneration), UInt64Bytes((ulong)generation), family);
             WriteRegistry(batch);
 
-            Interlocked.Exchange(ref _generation, generation);
+            PublishGeneration(generation);
             _aliases.Remove(record.Name);
             _records[database.Id] = dropped;
             _open.Remove(database.Id);
@@ -1718,18 +1752,31 @@ internal sealed class StoreEngine : IDisposable
     /// Begins a new log incarnation for every open database (spec 003 R5.2, 003 addendum B3), at promotion and before
     /// the node accepts writes, so each base is the history this node received, not anything written after.
     /// </summary>
-    internal bool BeginNewIncarnations(Func<bool> openWrites)
+    internal bool BeginNewIncarnations(Func<bool> openWrites) => BeginNewIncarnations(openWrites, out _);
+
+    /// <summary>
+    /// As <see cref="BeginNewIncarnations(Func{bool})"/>, also returning every open replicated database that carries a
+    /// resync marker, with its reason (spec 011 R2.4): the product decides whether to serve them.
+    /// </summary>
+    internal bool BeginNewIncarnations(Func<bool> openWrites, out IReadOnlyList<(string Name, string Reason)> pendingResync)
     {
         ArgumentNullException.ThrowIfNull(openWrites);
+        var pending = new List<(string Name, string Reason)>();
+        pendingResync = pending;
 
         // Under the store gate, with the write gate opened inside it: no database can open between its new history and
         // the first write it may take, so none is left without a record (tasks addendum, review of the fixes).
         lock (_gate)
         {
+            Hook("promote.incarnations");
             foreach (var slot in _open.Values)
             {
                 var record = _records[slot.Id];
                 var latest = (long)slot.LatestSequence;
+                if (record.Replicated && ResyncMarker.ReadReason(_dataDirectory, record.Uid) is { } marked)
+                {
+                    pending.Add((record.Name, marked));
+                }
 
                 // A database that still has a record holds this node's own writes that no other node received (it was
                 // never applied to as a standby since): continue that history, so its base stays below them. One that
@@ -1744,6 +1791,17 @@ internal sealed class StoreEngine : IDisposable
                 slot.SetIncarnation(incarnation);
             }
 
+            // Closed databases count too (review 2026-10-13, S5): after a restart a marked database is re-bootstrapped
+            // without being opened, and the product must still hear about it. Its history is decided when it opens.
+            foreach (var (id, record) in _records)
+            {
+                if (record.Replicated && record.State == LiveState && !_open.ContainsKey(id)
+                    && ResyncMarker.ReadReason(_dataDirectory, record.Uid) is { } marked)
+                {
+                    pending.Add((record.Name, marked));
+                }
+            }
+
             return openWrites();
         }
     }
@@ -1756,7 +1814,7 @@ internal sealed class StoreEngine : IDisposable
     /// </summary>
     private LogIncarnation? IncarnationOnOpen(bool replicated, string uid, long latest)
     {
-        if (!replicated || WriteGate.RefusedAs is not null)
+        if (!replicated || WriteGate.RefusedByRole is not null)
         {
             return null;
         }
@@ -1782,6 +1840,15 @@ internal sealed class StoreEngine : IDisposable
     /// </summary>
     private LogIncarnation NewHistory(string uid, long latest)
     {
+        // A database marked for re-bootstrap for any reason but a gap may hold batches the log it followed does not (a
+        // divergence, a rejoin): claiming that log as shared would let its other standbys continue on data it never
+        // had. A fresh history, so they re-bootstrap from this node instead (spec 011 R2.3). A gap only means behind:
+        // what it holds is a prefix of that log, which it continues.
+        if (ResyncMarker.ReadReason(_dataDirectory, uid) is { } marked && !ResyncMarker.IsGap(marked))
+        {
+            return LogIncarnation.Fresh(latest);
+        }
+
         if (FollowRecord.Read(_dataDirectory, uid)?.AsHistory() is not { } followed)
         {
             return LogIncarnation.Fresh(latest);

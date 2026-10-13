@@ -1,3 +1,4 @@
+// Ported from Highway: src/Highway.Server/HighwayReplicationOptions.cs (option names and defaults)
 using System;
 using System.Security.Cryptography.X509Certificates;
 
@@ -17,7 +18,12 @@ public sealed class ReplicationOptions
     /// <summary>Where the node's replication listener binds, e.g. <c>"0.0.0.0:7700"</c>. A standby listens too, to be promotable.</summary>
     public string? ListenEndpoint { get; init; }
 
-    /// <summary>The store's shared replication secret, used by the HMAC challenge (R10.5). Never logged.</summary>
+    /// <summary>
+    /// The store's shared replication secret, used by the HMAC challenge both ways (R10.5). Never logged. It proves that
+    /// the other end is a node of the same cluster, but over plain TCP it does not protect the session from an active
+    /// attacker on the path, who can relay a genuine handshake and alter what follows: set <see cref="Certificate"/> (TLS)
+    /// on any network not trusted end to end (spec 011 R1.6).
+    /// </summary>
     public required string Secret { get; init; }
 
     /// <summary>
@@ -78,4 +84,17 @@ public sealed class ReplicationOptions
     /// downloads, and connections not yet authenticated. One more is closed as soon as it is accepted.
     /// </summary>
     public int MaxConnections { get; init; } = 64;
+
+    /// <summary>
+    /// The most snapshot downloads a standby runs at once (spec 011 R3.2; default 2). Each runs beside the pull loop, so
+    /// a bootstrap never stalls the other databases; more wait their turn.
+    /// </summary>
+    public int MaxConcurrentBootstraps { get; init; } = 2;
+
+    /// <summary>
+    /// How long a standby waits for any one reply before it takes the connection as lost and reconnects (review
+    /// 2026-10-13, S4): a primary that vanished without closing the connection is otherwise waited for forever. A PULL
+    /// may wait <see cref="LongPollMax"/> on the primary, so it is given that much more. Internal: 30 s, shortened by tests.
+    /// </summary>
+    internal TimeSpan RequestTimeout { get; init; } = TimeSpan.FromSeconds(30);
 }

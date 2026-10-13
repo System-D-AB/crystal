@@ -1,3 +1,4 @@
+// Ported from Highway: src/Highway.Server/Storage/Rocks/ReplicaPuller.cs (the pull loop, gap → resync marker, format refusals, bootstrap retry)
 // Spec 003 T9 / design § 4 — the standby follower loop, ported from Highway's ReplicaPuller (one connection, HELLO →
 // PULL → apply) and generalised to a store: one connection, one PULL for every followed database, epoch adoption,
 // reconcile on a new set version, reconnect with backoff. RocksDB-touching (it opens databases and applies through
@@ -54,12 +55,47 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30)];
 
     private readonly Dictionary<string, (string Name, DateTimeOffset Due, int Attempt)> _pendingBootstraps = new(StringComparer.Ordinal);
+
+    // Snapshot downloads running beside the pull loop (spec 011 R3.1), at most MaxConcurrentBootstraps at once. Started
+    // and finished only on the loop, which alone changes the followed set (R3.5).
+    private readonly Dictionary<string, (string Name, string Directory, Task<SnapshotBegin> Download)> _downloads = new(StringComparer.Ordinal);
+    private SemaphoreSlim? _downloadSlots;
     private readonly HashSet<string> _clashesLogged = new(StringComparer.Ordinal);
     private readonly Task _loop;
 
     private long _lastSetVersion = -1;
 
     private readonly Action<ReplicationEvent>? _onEvent;
+    private readonly Observability.ReplicationMetrics? _metrics;
+
+    // The primary's latest position per database, from the last reply (spec 011 R10.4), and what is published to readers
+    // on other threads (Status, the lag gauge): replaced whole after each reply, never changed in place.
+    private readonly Dictionary<string, long> _primaryLatest = new(StringComparer.Ordinal);
+    private IReadOnlyList<(string Uid, long Position, long PrimaryLatest)> _positions = [];
+
+    /// <summary>Each followed database's position and its primary's latest, as of the last reply (spec 011 R10.4).</summary>
+    public IReadOnlyList<(string Uid, long Position, long PrimaryLatest)> Positions => Volatile.Read(ref _positions);
+
+    private void PublishPositions()
+    {
+        var positions = new List<(string Uid, long Position, long PrimaryLatest)>(_followed.Count);
+        foreach (var (uid, db) in _followed)
+        {
+            var position = (long)db.Watermark;
+            positions.Add((uid, position, _primaryLatest.TryGetValue(uid, out var latest) ? Math.Max(latest, position) : position));
+        }
+
+        Volatile.Write(ref _positions, positions);
+    }
+
+    /// <summary>Adopts a newer epoch a primary stated (003 R6.3), raising EpochChanged when it moved (spec 011 R10.3).</summary>
+    private void AdoptEpoch(long epoch, string from)
+    {
+        if (epoch > _epoch.Epoch && _epoch.BumpTo(epoch) == epoch)
+        {
+            _onEvent?.Invoke(new ReplicationEvent(ReplicationEventKind.EpochChanged, epoch, $"adopted epoch {epoch} from {from}"));
+        }
+    }
 
     public ReplicationFollower(
         CrystalStore store,
@@ -70,8 +106,10 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         string primaryEndpoint,
         string dataDirectory,
         ILogger? logger,
-        Action<ReplicationEvent>? onEvent = null)
+        Action<ReplicationEvent>? onEvent = null,
+        Observability.ReplicationMetrics? metrics = null)
     {
+        _metrics = metrics;
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _nodeId = nodeId ?? throw new ArgumentNullException(nameof(nodeId));
@@ -81,6 +119,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         _dataDirectory = dataDirectory ?? throw new ArgumentNullException(nameof(dataDirectory));
         _logger = logger;
         _onEvent = onEvent;
+        _downloadSlots = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrentBootstraps));
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
 
@@ -169,11 +208,14 @@ internal sealed class ReplicationFollower : IAsyncDisposable
 
     private async Task ConnectAndPumpAsync(CancellationToken ct)
     {
+        // Each connection reconciles first (spec 011 R11.3): the primary at this endpoint may be another node whose
+        // registry generation happens to equal the last one reconciled.
+        _lastSetVersion = -1;
         var (host, port) = ParseEndpoint(_primaryEndpoint);
-        await using var stream = await ReplicationTls.ConnectAsync(host, port, _options, ct).ConfigureAwait(false);
+        await using var stream = await ReplicationTls.ConnectAsync(host, port, _options, ct, _options.RequestTimeout).ConfigureAwait(false);
 
-        var client = new ReplicationClient(stream, _nodeId, _options.Secret);
-        await client.HandshakeAsync(ReplicationProtocol.RoleStandby, _epoch.Epoch, ct).ConfigureAwait(false);
+        var client = new ReplicationClient(stream, _nodeId, _options.Secret, () => _metrics?.FrameRefused("standby"), _options.RequestTimeout);
+        await client.HandshakeAsync(_epoch.RoleName, _epoch.Epoch, ct).ConfigureAwait(false);
 
         if (client.PrimaryEpoch < 1 || client.PrimaryEpoch > ReplicationProtocol.MaxEpoch)
         {
@@ -181,10 +223,33 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         }
 
         // Adopt the primary's epoch if it is newer (R6.3), before serving any page.
-        if (client.PrimaryEpoch > _epoch.Epoch)
+        AdoptEpoch(client.PrimaryEpoch, $"primary {client.PrimaryNodeId}");
+
+        // Two primaries at one epoch (spec 011 R7.1): nothing is taken from this one; the backoff retries, in case the
+        // product resolves it.
+        CheckForAnotherPrimaryAtTheSameEpoch(client.PrimaryNodeId, client.PrimaryEpoch, client.PrimaryRole);
+
+        // Connected and, when this method ends however it ends, lost (spec 011 R10.2): node id and endpoint only (R10.9).
+        if (_logger is not null)
         {
-            _epoch.BumpTo(client.PrimaryEpoch);
+            Observability.CrystalLog.ReplicationConnected(_logger, _epoch.Epoch, $"following {client.PrimaryNodeId} at {_primaryEndpoint}");
         }
+
+        try
+        {
+            await PumpAsync(client, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (_logger is not null)
+            {
+                Observability.CrystalLog.ReplicationDisconnected(_logger, _epoch.Epoch, $"no longer following {client.PrimaryNodeId} at {_primaryEndpoint}");
+            }
+        }
+    }
+
+    private async Task PumpAsync(ReplicationClient client, CancellationToken ct)
+    {
 
         // The set version each PULL reply states. DATABASES is asked for only when it differs from the one last
         // reconciled (design § 4 step 3), never before every pull: a catch-up costs one round trip per page (003
@@ -192,19 +257,26 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         long? statedSetVersion = null;
         while (!ct.IsCancellationRequested && _epoch.Role == ReplicationRole.Standby)
         {
-            var setVersion = statedSetVersion is { } stated && stated == _lastSetVersion
+            var setVersion = statedSetVersion is { } stated
+                && (stated == _lastSetVersion || (stated == _failedSetVersion && _engine.Clock.GetUtcNow() < _reconcileAgainAt))
                 ? stated
                 : await ReconcileIfChangedAsync(client, ct).ConfigureAwait(false);
 
+            FinishBootstraps();
             RetryDueBootstraps();
             var followed = CurrentFollowed();
-            if (followed.Count == 0)
+            if (followed.Count == 0 && _downloads.Count > 0)
             {
-                // Nothing to follow yet (reconcile may be a no-op until bootstrap, T10). Pull with no databases simply
-                // long-polls on the primary; wait a beat so an idle standby does not spin.
-                await Task.Delay(200, ct).ConfigureAwait(false);
+                // Nothing to follow until a download ends: wait for the first to finish, or a beat.
+                var pause = Task.Delay(200, ct);
+                var running = _downloads.Values.Select(d => (Task)d.Download).Append(pause).ToList();
+                await Task.WhenAny(running).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
                 continue;
             }
+
+            // With nothing to follow, the PULL names no database and simply long-polls on the primary until its set changes
+            // (spec 011 R11.6): one request per wait, and DATABASES only when the reply states a new set version.
 
             var pullReply = await PullAsync(client, followed, ct).ConfigureAwait(false);
             if (pullReply is null)
@@ -222,7 +294,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             // A newer epoch on the reply is adopted; an older one means a stale primary — refuse the reply (R4.3).
             if (pageEpoch > _epoch.Epoch)
             {
-                _epoch.BumpTo(pageEpoch);
+                AdoptEpoch(pageEpoch, $"a page from primary {client.PrimaryNodeId}");
             }
             else if (pageEpoch < _epoch.Epoch)
             {
@@ -230,6 +302,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             }
 
             var appliedAnything = ApplyEntries(pageEpoch, client.PrimaryNodeId, entries);
+            PublishPositions();
             _engine.RunHook("follower.applied");
 
             // No sleep when something was applied (catch-up runs flat out); the empty PULL already long-polled on the
@@ -238,6 +311,75 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             {
                 _ = setVersion; // (kept for a future "resync on set-version churn" refinement)
             }
+        }
+    }
+
+    private bool _conflictReported;
+
+    // The primary's set as last parsed: a download that finishes after the primary dropped or renamed its database is
+    // checked against it before it is installed (review 2026-10-13, S3).
+    private IReadOnlyList<ReplicatedDatabase>? _primarySet;
+    private DateTimeOffset _reconcileAgainAt = DateTimeOffset.MinValue;
+    private long _failedSetVersion = -1;
+
+    /// <summary>
+    /// The name the primary lists <paramref name="uid"/> under now, or null when it no longer lists it (dropped). Without
+    /// a parsed set yet, <paramref name="fallback"/>.
+    /// </summary>
+    private string? CurrentName(string uid, string fallback)
+    {
+        if (_primarySet is null)
+        {
+            return fallback;
+        }
+
+        foreach (var remote in _primarySet)
+        {
+            if (string.Equals(remote.Uid, uid, StringComparison.Ordinal))
+            {
+                return remote.Name;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Compares the primary just authenticated with the last one followed (spec 011 R7.1): a different node stating the
+    /// same epoch is a second primary at that epoch (003 R6.4). Reports it once, with both ids and endpoints, and refuses
+    /// the connection, so nothing is taken from it. Otherwise records it as the primary followed.
+    /// </summary>
+    private void CheckForAnotherPrimaryAtTheSameEpoch(string nodeId, long epoch, string role)
+    {
+        // Only a peer that says it is a primary: every node of a healthy cluster shares the epoch, so a standby or a
+        // fenced node at it is no second primary (it refuses the pulls by itself).
+        if (!string.Equals(role, ReplicationProtocol.RolePrimary, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var last = PrimaryRecord.Read(_dataDirectory);
+        if (last is not null && last.Epoch == epoch && !string.Equals(last.NodeId, nodeId, StringComparison.Ordinal))
+        {
+            if (!_conflictReported)
+            {
+                _conflictReported = true;
+                _onEvent?.Invoke(new ReplicationEvent(ReplicationEventKind.Conflict, epoch,
+                    $"two primaries at epoch {epoch}: {last.NodeId} at {last.Endpoint}, followed before, and {nodeId} at {_primaryEndpoint}")
+                {
+                    PeerNodeId = nodeId,
+                    PeerEndpoint = _primaryEndpoint,
+                });
+            }
+
+            throw new ReplicationProtocolException(
+                $"{ReplicationProtocol.ErrEpoch} {nodeId} states epoch {epoch}, at which this node followed {last.NodeId}: two primaries; nothing is taken");
+        }
+
+        if (last is null || last.Epoch != epoch || !string.Equals(last.NodeId, nodeId, StringComparison.Ordinal)
+            || !string.Equals(last.Endpoint, _primaryEndpoint, StringComparison.Ordinal))
+        {
+            PrimaryRecord.Write(_dataDirectory, nodeId, epoch, _primaryEndpoint);
         }
     }
 
@@ -257,13 +399,20 @@ internal sealed class ReplicationFollower : IAsyncDisposable
 
         var setVersion = top[0].Integer;
         var primarySet = ParseDatabaseSet(top[1]);
+        _primarySet = primarySet;
 
         if (setVersion != _lastSetVersion)
         {
-            // The set version counts as handled only when every step took effect; otherwise the next pull asks again.
+            // The set version counts as handled only when every step took effect; otherwise it is asked again, but at
+            // most once per long poll (review 2026-10-13, M8: a name that stays taken would cost a DATABASES a commit).
             if (Reconcile(primarySet))
             {
                 _lastSetVersion = setVersion;
+            }
+            else
+            {
+                _failedSetVersion = setVersion;
+                _reconcileAgainAt = _engine.Clock.GetUtcNow() + _options.LongPollMax;
             }
         }
 
@@ -344,7 +493,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
 
             if (_engine.OpenReplicatedByUid(_store, remote.Uid) is { } slot)
             {
-                _followed[remote.Uid] = new StandbyDatabase(slot, remote.Uid, _dataDirectory, _epoch.Epoch);
+                _followed[remote.Uid] = new StandbyDatabase(slot, remote.Uid, _dataDirectory, _epoch.Epoch, _engine.RunHook);
             }
         }
 
@@ -359,42 +508,90 @@ internal sealed class ReplicationFollower : IAsyncDisposable
     internal static string ReconcileTemporaryName(string uid) => "~reconcile-" + uid;
 
     /// <summary>
-    /// Bootstraps a new replicated database over its own connection (design § 7): download the snapshot, verify it,
-    /// install it under the primary's UID, record the follow point, and add it to the followed set. A failure leaves
-    /// nothing installed (the download goes to a sibling directory); it is retried on the next reconcile.
+    /// Starts bootstrapping a replicated database over its own connection (design § 7), beside the pull loop (spec 011
+    /// R3.1): the snapshot downloads into a sibling directory while every other database keeps following;
+    /// <see cref="FinishBootstraps"/> installs it on the loop. A database already downloading is left to it.
     /// </summary>
     private void TryBootstrap(string uid, string name)
     {
-        var bootstrapDir = Path.Combine(_dataDirectory, $"bootstrap-{Guid.NewGuid():N}");
-        try
+        if (_downloads.ContainsKey(uid))
         {
-            var begin = DownloadSnapshot(uid, bootstrapDir);
-            _engine.RunHook("bootstrap.downloaded");
-            var handle = _engine.InstallBootstrap(_store, uid, name, bootstrapDir);
-
-            // Record the follow point from the snapshot's incarnation and base (R7.7), clear any resync marker (the
-            // re-bootstrap this fulfils, R5.4), then follow the database.
-            FollowRecord.Write(_dataDirectory, uid, begin.Incarnation, begin.Base);
-            ResyncMarker.Clear(_dataDirectory, uid);
-            if (_engine.OpenReplicatedByUid(_store, uid) is { } slot)
-            {
-                _followed[uid] = new StandbyDatabase(slot, uid, _dataDirectory, _epoch.Epoch);
-            }
-
-            _logger?.LogInformation("[replication] bootstrapped a replicated database from a snapshot ({Files} files)", begin.Manifest.Count);
-            _ = handle;
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException || !_cts.IsCancellationRequested)
-        {
-            TryDeleteDirectory(bootstrapDir);
-            var attempt = _pendingBootstraps.TryGetValue(uid, out var pending) ? pending.Attempt + 1 : 0;
-            var wait = BootstrapRetry[Math.Min(attempt, BootstrapRetry.Length - 1)];
-            _pendingBootstraps[uid] = (name, _engine.Clock.GetUtcNow() + wait, attempt);
-            _logger?.LogWarning("[replication] snapshot bootstrap failed ({Error}); retrying in {Wait}", ex.Message, wait);
             return;
         }
 
-        _pendingBootstraps.Remove(uid);
+        var bootstrapDir = Path.Combine(_dataDirectory, $"bootstrap-{Guid.NewGuid():N}");
+        var ct = _cts.Token;
+        var slots = _downloadSlots!;
+        var download = Task.Run(
+            async () =>
+            {
+                await slots.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    return await DownloadSnapshotAsync(uid, bootstrapDir, ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    slots.Release();
+                }
+            },
+            ct);
+        _downloads[uid] = (name, bootstrapDir, download);
+    }
+
+    /// <summary>
+    /// Installs every download that has finished (on the loop, R3.5): install it under the primary's UID, record the
+    /// follow point, and add it to the followed set. A failed download or install leaves nothing installed and is
+    /// retried on its own schedule.
+    /// </summary>
+    private void FinishBootstraps()
+    {
+        foreach (var (uid, (listedName, bootstrapDir, download)) in _downloads.Where(d => d.Value.Download.IsCompleted).ToList())
+        {
+            _downloads.Remove(uid);
+
+            // The primary's set may have changed while it downloaded (review 2026-10-13, S3): a database it dropped is
+            // not installed, and a renamed one is installed under its name now.
+            var current = download.IsCompletedSuccessfully ? CurrentName(uid, listedName) : listedName;
+            if (current is null)
+            {
+                TryDeleteDirectory(bootstrapDir);
+                _pendingBootstraps.Remove(uid);
+                _logger?.LogInformation("[replication] a snapshot downloaded for a database the primary no longer lists was discarded");
+                _engine.RunHook("bootstrap.discarded");
+                continue;
+            }
+
+            var name = current;
+            try
+            {
+                var begin = download.GetAwaiter().GetResult(); // completed: its failure, if any, is thrown here
+                _engine.RunHook("bootstrap.downloaded");
+                _engine.InstallBootstrap(_store, uid, name, bootstrapDir);
+
+                // Record the follow point from the snapshot's incarnation and base (R7.7), clear any resync marker (the
+                // re-bootstrap this fulfils, R5.4), then follow the database.
+                FollowRecord.Write(_dataDirectory, uid, begin.Incarnation, begin.Base);
+                ResyncMarker.Clear(_dataDirectory, uid);
+                if (_engine.OpenReplicatedByUid(_store, uid) is { } slot)
+                {
+                    _followed[uid] = new StandbyDatabase(slot, uid, _dataDirectory, _epoch.Epoch, _engine.RunHook);
+                }
+
+                _logger?.LogInformation("[replication] bootstrapped a replicated database from a snapshot ({Files} files)", begin.Manifest.Count);
+                _metrics?.Bootstrapped(); // spec 011 R10.1
+                _pendingBootstraps.Remove(uid);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !_cts.IsCancellationRequested)
+            {
+                TryDeleteDirectory(bootstrapDir);
+                var attempt = _pendingBootstraps.TryGetValue(uid, out var pending) ? pending.Attempt + 1 : 0;
+                var wait = BootstrapRetry[Math.Min(attempt, BootstrapRetry.Length - 1)];
+                _pendingBootstraps[uid] = (name, _engine.Clock.GetUtcNow() + wait, attempt);
+                _logger?.LogWarning("[replication] snapshot bootstrap failed ({Error}); retrying in {Wait}", ex.Message, wait);
+                _engine.RunHook("bootstrap.failed");
+            }
+        }
     }
 
     /// <summary>Retries every failed bootstrap whose backoff has passed (R7.2, R7.4).</summary>
@@ -408,21 +605,69 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         var now = _engine.Clock.GetUtcNow();
         foreach (var (uid, pending) in _pendingBootstraps.ToList())
         {
-            if (pending.Due <= now && !_followed.ContainsKey(uid))
+            if (pending.Due <= now && !_followed.ContainsKey(uid) && !_downloads.ContainsKey(uid))
             {
-                TryBootstrap(uid, pending.Name);
+                // Retried under the primary's current name, and not at all once it no longer lists the database (S3).
+                if (CurrentName(uid, pending.Name) is { } name)
+                {
+                    TryBootstrap(uid, name);
+                }
+                else
+                {
+                    _pendingBootstraps.Remove(uid);
+                }
             }
         }
     }
 
-    private SnapshotBegin DownloadSnapshot(string uid, string bootstrapDir)
+    private async Task<SnapshotBegin> DownloadSnapshotAsync(string uid, string bootstrapDir, CancellationToken ct)
     {
-        // Its own connection (design § 7): a snapshot download must not block the pull loop's connection.
-        var (host, port) = ParseEndpoint(_primaryEndpoint);
-        using var stream = ReplicationTls.ConnectAsync(host, port, _options, _cts.Token).GetAwaiter().GetResult();
-        var client = new ReplicationClient(stream, _nodeId, _options.Secret);
-        client.HandshakeAsync(ReplicationProtocol.RoleStandby, _epoch.Epoch, _cts.Token).GetAwaiter().GetResult();
-        return SnapshotBootstrap.DownloadAsync(client, uid, bootstrapDir, _cts.Token).GetAwaiter().GetResult();
+        // Its own connection (design § 7), and a new one to resume on if it is lost (spec 011 R3.3).
+        var streams = new List<Stream>();
+        try
+        {
+            return await SnapshotBootstrap.DownloadAsync(
+                async c =>
+                {
+                    var (host, port) = ParseEndpoint(_primaryEndpoint);
+                    var stream = await ReplicationTls.ConnectAsync(host, port, _options, c, _options.RequestTimeout).ConfigureAwait(false);
+                    streams.Add(stream);
+                    var client = new ReplicationClient(stream, _nodeId, _options.Secret, () => _metrics?.FrameRefused("standby"), _options.RequestTimeout);
+                    await client.HandshakeAsync(_epoch.RoleName, _epoch.Epoch, c).ConfigureAwait(false);
+                    return client;
+                },
+                uid,
+                bootstrapDir,
+                ct,
+                checkBegin: CheckSnapshotEpoch,
+                hook: _engine.RunHook).ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (var stream in streams)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A snapshot is taken only from a primary at least as new as the newest epoch seen (spec 011 R3.4, as a page is,
+    /// 003 R4.3); a newer epoch is adopted, as from a page.
+    /// </summary>
+    private void CheckSnapshotEpoch(SnapshotBegin begin)
+    {
+        var own = _epoch.Epoch;
+        switch (SnapshotBootstrap.JudgeEpoch(begin.Epoch, own))
+        {
+            case SnapshotBootstrap.EpochVerdict.Refuse:
+                throw new ReplicationProtocolException(
+                    $"{ReplicationProtocol.ErrEpoch} the snapshot is from epoch {begin.Epoch}, not at or above this node's {own}; nothing is installed");
+            case SnapshotBootstrap.EpochVerdict.Adopt when _epoch.BumpTo(begin.Epoch) == begin.Epoch:
+                _onEvent?.Invoke(new ReplicationEvent(ReplicationEventKind.EpochChanged, begin.Epoch,
+                    $"adopted epoch {begin.Epoch} from the primary's snapshot"));
+                break;
+        }
     }
 
     private static void TryDeleteDirectory(string dir)
@@ -459,7 +704,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             args.Add(Bytes(((long)db.Watermark).ToString(CultureInfo.InvariantCulture)));
         }
 
-        var reply = await client.RequestAsync(args, ct).ConfigureAwait(false);
+        var reply = await client.RequestAsync(args, ct, extraWait: _options.LongPollMax).ConfigureAwait(false); // it may wait on the primary
         if (reply.Type == RespType.Error)
         {
             if ((reply.Text ?? string.Empty).StartsWith(ReplicationProtocol.ErrNotPrimary, StringComparison.Ordinal))
@@ -489,6 +734,8 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                 continue; // an entry for a database we are not following yet (awaiting bootstrap)
             }
 
+            _primaryLatest[entry.Uid] = entry.Latest; // 003 R3.7
+
             switch (entry.Status)
             {
                 case var s when s == ReplicationProtocol.EntryOk:
@@ -504,6 +751,9 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                     if (result.Status == ApplyStatus.Applied && result.Applied > 0)
                     {
                         appliedAnything = true;
+
+                        // The batches skipped (already held) come first in a page; the rest were written (spec 011 R10.1).
+                        _metrics?.PageApplied(entry.Batches.Skip(result.Skipped).Sum(b => (long)b.Data.Length));
                     }
                     else if (result.Status == ApplyStatus.NotContiguous)
                     {
@@ -520,6 +770,10 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                     break;
                 case var s when s == ReplicationProtocol.EntryGone:
                     // The primary dropped it; reconcile will drop it locally on the next set-version change.
+                    break;
+                case var s when s == ReplicationProtocol.EntryOversize:
+                    // A batch too large for any reply (spec 011 R4.1): the snapshot carries it.
+                    MarkAndReBootstrap(entry.Uid, "gap (oversize batch)");
                     break;
             }
         }
@@ -680,18 +934,26 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                 history.Add(new IncarnationEnd(id, pair[1].Integer));
             }
 
-            entries.Add(new PullEntry(uid, status, incarnation, @base, batches, history));
+            entries.Add(new PullEntry(uid, status, incarnation, @base, f[4].Integer, batches, history));
         }
 
         return entries;
     }
 
-    private static (string Host, int Port) ParseEndpoint(string endpoint)
+    /// <summary>
+    /// Parses <c>host:port</c> (an IPv6 host in brackets). Throws <see cref="ArgumentException"/> naming the expected form
+    /// for anything else, so <c>Follow</c> refuses a bad endpoint at once (spec 011 R11.5) instead of looping on it.
+    /// </summary>
+    internal static (string Host, int Port) ParseEndpoint(string endpoint)
     {
-        var colon = endpoint.LastIndexOf(':');
-        if (colon < 0 || !int.TryParse(endpoint.AsSpan(colon + 1), out var port))
+        var colon = endpoint?.LastIndexOf(':') ?? -1;
+        if (endpoint is null || colon < 0
+            || !int.TryParse(endpoint.AsSpan(colon + 1), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var port)
+            || port is < 1 or > 65535)
         {
-            throw new ArgumentException($"'{endpoint}' is not a valid host:port endpoint.", nameof(endpoint));
+            throw new ArgumentException(
+                $"'{endpoint}' is not a replication endpoint: expected host:port, such as 127.0.0.1:7700 or [::1]:7700, with a port from 1 to 65535.",
+                nameof(endpoint));
         }
 
         var host = endpoint[..colon].Trim('[', ']');
@@ -717,11 +979,27 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             db.StopFollowing();
         }
 
+        // Downloads still running were cancelled with the loop: wait for them, then remove what they wrote.
+        foreach (var (_, bootstrapDir, download) in _downloads.Values)
+        {
+            try
+            {
+                await download.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Cancelled or failed; the folder goes either way.
+            }
+
+            TryDeleteDirectory(bootstrapDir);
+        }
+
+        _downloadSlots?.Dispose();
         _cts.Dispose();
     }
 
     /// <summary>One parsed PULL entry (design § 8.2).</summary>
     private readonly record struct PullEntry(
-        string Uid, string Status, string Incarnation, long Base, IReadOnlyList<(ulong Seq, byte[] Data)> Batches,
+        string Uid, string Status, string Incarnation, long Base, long Latest, IReadOnlyList<(ulong Seq, byte[] Data)> Batches,
         IReadOnlyList<IncarnationEnd> History);
 }

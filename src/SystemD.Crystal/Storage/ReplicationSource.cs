@@ -1,3 +1,4 @@
+// Ported from Highway: src/Highway.Server/Storage/Rocks/ReplicationFeeder.cs (slots, lag cap, pulls, epochs, status, the reconciliation report)
 // Spec 003 T7 / R2, R3; design § 3, § 4 — the primary side of replication: it answers DATABASES and PULL, keeps a
 // slot per (standby, database), serves a pull from each database's tail or WAL within a page cap, long-polls a
 // caught-up pull on commits and set-version changes, and reports gap / diverged / gone per database without failing
@@ -47,7 +48,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         _nodeId = nodeId ?? throw new ArgumentNullException(nameof(nodeId));
         _epoch = epoch ?? throw new ArgumentNullException(nameof(epoch));
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        _snapshots = new SnapshotSessions(store.DataDirectory, engine.Clock);
+        _snapshots = new SnapshotSessions(store.DataDirectory, engine.Clock, engine.RunHook);
 
         // R2.3: a standby that goes silent is dropped after SlotStaleAfter even if nobody pulls or reads the status, so its
         // drop event is raised on time. Pulls and status reads age the slots too.
@@ -55,6 +56,9 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             ? TimeSpan.FromTicks(Math.Clamp(options.SlotStaleAfter.Ticks / 4, TimeSpan.TicksPerSecond, 15 * TimeSpan.TicksPerSecond))
             : TimeSpan.FromSeconds(5);
         _slotTimer = engine.Clock.CreateTimer(_ => AgeSlotsQuietly(), null, period, period);
+
+        // A change of the replicated set wakes a waiting pull at once (spec 011 R11.1, 003 R3.4), as a commit does.
+        engine.RegistryChanged += _change.Signal;
     }
 
     private readonly ITimer _slotTimer;
@@ -71,7 +75,13 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
     /// <summary>Raised for each replication event (R9.3). Set by the facade; null drops events.</summary>
     internal Action<ReplicationEvent>? OnEvent { get; set; }
 
-    public void ObservePeer(long peerEpoch, string peerRole, string peerNodeId)
+    /// <summary>Called with the path of a reconciliation report written by a demotion a peer caused (spec 011 R8.3).</summary>
+    internal Action<string>? OnReport { get; set; }
+
+    /// <summary>Called with the batch bytes of each pull reply sent (spec 011 R10.1).</summary>
+    internal Action<long>? OnShipped { get; set; }
+
+    public void ObservePeer(long peerEpoch, string peerRole, string peerNodeId, string? peerEndpoint = null)
     {
         if (peerEpoch > _epoch.Epoch)
         {
@@ -79,27 +89,59 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             var transition = _epoch.ObserveHigherEpoch(peerEpoch);
             if (transition != EpochTransition.None)
             {
+                // Every demotion writes the report (spec 011 R8.3), this one too: what this node committed beyond any
+                // standby's acknowledgement. Written after the epoch's lock and the wait for admitted writes, and before
+                // the slots are cleared below, since their acknowledged positions are the report's floor.
+                string? report = null;
+                try
+                {
+                    report = transition == EpochTransition.Demoted ? WriteReconciliationReport() : null;
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    // The node has stood down either way: a report that could not be written must not stop the clearing
+                    // and the events below (re-review 2026-10-13, M7).
+                    report = null;
+                    _ = ex;
+                }
+                if (report is not null)
+                {
+                    OnReport?.Invoke(report);
+                }
+
                 ClearAllHistory();
                 OnEvent?.Invoke(new ReplicationEvent(ReplicationEventKind.EpochChanged, _epoch.Epoch,
-                    $"adopted epoch {peerEpoch} from node {peerNodeId}"));
+                    $"adopted epoch {peerEpoch} from node {peerNodeId}") { PeerNodeId = peerNodeId, PeerEndpoint = peerEndpoint });
                 if (transition == EpochTransition.Demoted)
                 {
+
                     OnEvent?.Invoke(new ReplicationEvent(ReplicationEventKind.Demoted, _epoch.Epoch,
-                        $"a higher epoch {peerEpoch} from node {peerNodeId} superseded this primary"));
+                        report is null
+                            ? $"a higher epoch {peerEpoch} from node {peerNodeId} superseded this primary"
+                            : $"a higher epoch {peerEpoch} from node {peerNodeId} superseded this primary; reconciliation report at {report}")
+                    {
+                        PeerNodeId = peerNodeId,
+                        PeerEndpoint = peerEndpoint,
+                    });
                 }
             }
 
             return;
         }
 
-        // Equal epoch from another primary is a conflict (R6.4): report it with both node ids; never apply either way.
+        // Equal epoch from another primary is a conflict (R6.4): report it with both node ids and endpoints; never apply
+        // either way. (The node-id check is moot since peers stating this node's own id are refused, spec 011 R1.3.)
         if (peerEpoch == _epoch.Epoch
             && _epoch.Role == ReplicationRole.Primary
             && string.Equals(peerRole, ReplicationProtocol.RolePrimary, StringComparison.Ordinal)
             && !string.Equals(peerNodeId, _nodeId, StringComparison.Ordinal))
         {
             OnEvent?.Invoke(new ReplicationEvent(ReplicationEventKind.Conflict, _epoch.Epoch,
-                $"two primaries at epoch {_epoch.Epoch}: this node {_nodeId} and peer {peerNodeId}"));
+                $"two primaries at epoch {_epoch.Epoch}: this node {_nodeId} at {_options.ListenEndpoint} and peer {peerNodeId} at {peerEndpoint}")
+            {
+                PeerNodeId = peerNodeId,
+                PeerEndpoint = peerEndpoint,
+            });
         }
     }
 
@@ -110,6 +152,15 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         {
             foreach (var serving in _byUid.Values)
             {
+                // Entered like any call (spec 011 R6.1): a drop or close waits for the clear, and a database already
+                // closing is skipped (its close releases the tail and readers itself).
+                using var scope = serving.Enter();
+                if (scope is null)
+                {
+                    continue;
+                }
+
+                _engine.RunHook("clear.entered");
                 serving.ClearTail();
             }
         }
@@ -126,36 +177,44 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
     internal string? WriteReconciliationReport()
     {
         var databases = new List<ReconciliationDatabase>();
-        lock (_dbGate)
+
+        // Every replicated database of this node (spec 011 R8.1), not only those a standby happened to pull: one no
+        // standby has pulled holds writes nobody acknowledged, from position 0.
+        foreach (var replicated in _engine.ReplicatedDatabaseSet())
         {
-            foreach (var serving in _byUid.Values)
+            DatabaseSlot? slotHandle;
+            try
             {
-                using var scope = serving.Enter();
-                if (scope is null)
-                {
-                    continue; // dropped or closing: nothing of it is served any more
-                }
-
-                var latest = serving.Latest;
-                var acked = MinAckedForUid(serving.Uid);
-                if (latest <= acked)
-                {
-                    continue; // every local write was acknowledged by every standby of this database
-                }
-
-                // Read the unreplicated tail from the acked position, decode per box.
-                var slotHandle = _engine.OpenReplicatedByUid(_store, serving.Uid);
-                if (slotHandle is null)
-                {
-                    continue;
-                }
-
-                var batches = new List<(ulong Seq, byte[] Data)>();
-                var wal = new WalAccess(slotHandle.Instance);
-                var status = wal.ReadPage((ulong)acked, int.MaxValue, batches);
-                var (boxes, undecoded) = WalTailSummary.Describe(batches, id => NameOfBox(slotHandle, id));
-                databases.Add(new ReconciliationDatabase(serving.Uid, acked, latest, status == WalPageStatus.Gap, undecoded, boxes));
+                slotHandle = _engine.OpenReplicatedByUid(_store, replicated.Uid);
             }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A database that cannot be opened now (the open cap, a refused format) is listed as unreadable rather
+                // than ending the report, or the demotion that writes it (review 2026-10-13, M7).
+                databases.Add(new ReconciliationDatabase(replicated.Uid, MinAckedForUid(replicated.Uid), -1, TailUndecodableGap: true, UndecodedBatches: 0, Boxes: []));
+                continue;
+            }
+
+            using var scope = slotHandle?.TryEnter();
+            if (slotHandle is null || scope is null)
+            {
+                continue; // dropped or closing: nothing of it can be reported any more
+            }
+
+            var latest = (long)slotHandle.LatestSequence;
+            var acked = MinAckedForUid(replicated.Uid);
+            if (latest <= acked)
+            {
+                continue; // every local write was acknowledged by every standby of this database
+            }
+
+            // Read the unreplicated tail from the acked position, decode per box. A WAL that no longer reaches it is
+            // reported as such (TailUndecodableGap): the batches before it are on disk but cannot be listed.
+            var batches = new List<(ulong Seq, byte[] Data)>();
+            var wal = new WalAccess(slotHandle.Instance);
+            var status = wal.ReadPage((ulong)acked, int.MaxValue, batches);
+            var (boxes, undecoded) = WalTailSummary.Describe(batches, id => NameOfBox(slotHandle, id));
+            databases.Add(new ReconciliationDatabase(replicated.Uid, acked, latest, status == WalPageStatus.Gap, undecoded, boxes));
         }
 
         if (databases.Count == 0)
@@ -333,7 +392,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             return;
         }
 
-        var maxBytes = (int)Math.Clamp(maxBytesRaw, 1, _options.PageBytes);
+        var maxBytes = (int)Math.Clamp(maxBytesRaw, 1, Math.Min(_options.PageBytes, ReplicationProtocol.MaxPageBytes));
         var waitMs = (int)Math.Clamp(waitMsRaw, 0, (long)_options.LongPollMax.TotalMilliseconds);
 
         var requests = new List<(string Uid, long From)>();
@@ -358,7 +417,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         var epoch = _epoch.Epoch;
         var mark = _change.Mark;
         var entries = BuildEntries(requests, maxBytes);
-        if (waitMs > 0 && NothingToSend(entries) && _change.WaitForChange(mark, waitMs))
+        if (waitMs > 0 && NothingToSend(entries) && WaitForChange(mark, waitMs))
         {
             entries = BuildEntries(requests, maxBytes);
         }
@@ -377,15 +436,24 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             return;
         }
 
+        ForgetWhatTheStandbyDoesNotHold(peerNodeId, requests, entries);
+
         // [epoch, setVersion, [entry…]] (design § 8.2).
         reply.ArrayHeader(3)
             .Integer(epoch)
             .Integer(_engine.ReplicatedSetVersion)
             .ArrayHeader(entries.Count);
+        long shipped = 0;
         foreach (var entry in entries)
         {
             WriteEntry(reply, entry);
+            foreach (var (_, data) in entry.Batches)
+            {
+                shipped += data.Length;
+            }
         }
+
+        OnShipped?.Invoke(shipped); // spec 011 R10.1
     }
 
     // ----------------------------------------------------------------- SNAPSHOT
@@ -527,6 +595,9 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     private int _nextFirst;
 
+    /// <summary>The largest batch shipped in a page (spec 011 R4.1); lowered by tests, which cannot commit 32 MiB batches.</summary>
+    internal int MaxShippableBatch { get; set; } = ReplicationProtocol.MaxShippableBatch;
+
     /// <summary>
     /// One entry per requested database (design § 4). <paramref name="maxBytes"/> is the page for the <b>whole reply</b>
     /// (R3.2, 003 addendum B4): each database is served from what the ones before it left, and a database is skipped
@@ -563,6 +634,15 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             var result = remaining > 0
                 ? serving.Serve(from, (int)remaining, batches, out _)
                 : serving.Position(from);
+
+            // A batch too large for any reply is never sent: the standby could not read the reply, and would ask again
+            // forever (spec 011 R4.1). It re-bootstraps this database instead; the others are served as usual.
+            if (batches.Exists(b => b.Data.Length > MaxShippableBatch))
+            {
+                entries[i] = Entry.Oversize(uid, serving);
+                continue;
+            }
+
             foreach (var (_, data) in batches)
             {
                 remaining -= data.Length;
@@ -697,11 +777,42 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         }
     }
 
+    /// <summary>
+    /// A slot says what a standby holds, so it may never say more (review 2026-10-13, S2): a database the standby's PULL no
+    /// longer names (it stopped following it, or is re-bootstrapping it) has no slot, and a standby told it diverged holds
+    /// nothing of this log there, so its slot is at 0. Otherwise a stale position would count as caught up: in a handover
+    /// (spec 011 R14) and as the reconciliation report's floor.
+    /// </summary>
+    private void ForgetWhatTheStandbyDoesNotHold(string standbyNodeId, List<(string Uid, long From)> requests, List<Entry> entries)
+    {
+        var named = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (uid, _) in requests)
+        {
+            named.Add(uid);
+        }
+        var prefix = standbyNodeId + "\u0000";
+        foreach (var key in _slots.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal) && !named.Contains(key[prefix.Length..]))
+            {
+                _slots.TryRemove(key, out _);
+            }
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry.Status == ReplicationProtocol.EntryDiverged)
+            {
+                UpdateSlot(standbyNodeId, entry.Uid, 0);
+            }
+        }
+    }
+
     private void UpdateSlot(string standbyNodeId, string uid, long acked)
     {
         // The slot is keyed by (standby node id, uid), so two standbys at different positions do not share one slot
-        // (R2.2). The standby node id is the authenticated one from HELLO. The acked value only ever advances; a stale
-        // re-pull does not move it back. The state is left to AgeSlots, which every pull runs next: a contact within the
+        // (R2.2). The standby node id is the authenticated one from HELLO. The acked value is the position the standby
+        // last stated (spec 011 R8.2), forward or back. The state is left to AgeSlots, which every pull runs next: a contact within the
         // cap makes even a dropped slot active again (R2.3: an observation, not a hold), and a standby that stays behind
         // does not raise its event again on every pull.
         var key = standbyNodeId + "\u0000" + uid;
@@ -712,7 +823,9 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             _ => new Slot(standbyNodeId, uid, acked, epoch, now, SlotState.Active),
             (_, existing) => existing with
             {
-                Acked = Math.Max(existing.Acked, acked),
+                // The position the standby last stated, not the highest ever (spec 011 R8.2): a standby that re-bootstraps
+                // lower (after a divergence) holds no more than it says, and the report's floor and the lag follow it.
+                Acked = acked,
                 Epoch = epoch,
                 LastContact = now,
             });
@@ -834,6 +947,12 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     private void Signal() => _change.Signal();
 
+    private bool WaitForChange(long mark, int waitMs)
+    {
+        _engine.RunHook("pull.waiting"); // tests: act only once a pull is really waiting
+        return _change.WaitForChange(mark, waitMs);
+    }
+
     /// <summary>Wakes every waiting pull: the role or epoch changed (R3.4), and each must answer for the new state.</summary>
     internal void SignalRoleOrEpochChange() => _change.Signal();
 
@@ -857,6 +976,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     public void Dispose()
     {
+        _engine.RegistryChanged -= _change.Signal;
         lock (_dbGate)
         {
             if (_disposed)
@@ -922,6 +1042,9 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
         public static Entry Diverged(string uid, DatabaseReplication db)
             => Of(uid, ReplicationProtocol.EntryDiverged, db, [], 0);
+
+        public static Entry Oversize(string uid, DatabaseReplication db)
+            => Of(uid, ReplicationProtocol.EntryOversize, db, [], 0);
 
         private static Entry Of(string uid, string status, DatabaseReplication db, IReadOnlyList<(ulong Seq, byte[] Data)> batches, long gapFirst)
         {

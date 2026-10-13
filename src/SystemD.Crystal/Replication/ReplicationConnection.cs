@@ -41,13 +41,39 @@ internal sealed class ReplicationConnection
     private long _peerEpoch;
     private CancellationToken _preAuthDeadline;
 
-    public ReplicationConnection(Stream stream, IReplicationSource source, string remote, ILogger? logger, TimeSpan? preAuthTimeout = null)
+    public ReplicationConnection(
+        Stream stream, IReplicationSource source, string remote, ILogger? logger, TimeSpan? preAuthTimeout = null,
+        int requestCap = ReplicationProtocol.RequestCap, Action? onFrameRefused = null, CancellationToken? preAuthDeadline = null,
+        Action? onAuthenticated = null)
     {
+        _onAuthenticated = onAuthenticated;
+        _givenPreAuthDeadline = preAuthDeadline;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _remote = remote;
         _logger = logger;
         _preAuthTimeout = preAuthTimeout ?? ReplicationProtocol.PreAuthTimeout;
+        _requestCap = requestCap;
+        _onFrameRefused = onFrameRefused;
+    }
+
+    private readonly int _requestCap;
+    private readonly Action? _onFrameRefused;
+
+    // A deadline begun by the listener at accept, shared with the TLS handshake (spec 011 R11.8); otherwise one begun here.
+    private readonly CancellationToken? _givenPreAuthDeadline;
+
+    // Tells the listener this connection no longer counts as unauthenticated (spec 011 R11.9).
+    private readonly Action? _onAuthenticated;
+
+    /// <summary>
+    /// A request refused for its size (spec 011 R4.3): logged once (the connection then closes) and counted, so a store
+    /// whose PULLs outgrow the cap is seen, not silently cut off.
+    /// </summary>
+    private void FrameRefused(int cap, string detail)
+    {
+        _onFrameRefused?.Invoke();
+        _logger?.LogWarning("Replication request from {Remote} refused: over the {Cap}-byte cap ({Detail}).", _remote, cap, detail);
     }
 
     private readonly TimeSpan _preAuthTimeout;
@@ -56,17 +82,24 @@ internal sealed class ReplicationConnection
     /// Serves the connection until it closes or <paramref name="cancellationToken"/> fires. Returns when the peer
     /// disconnects, a protocol error closes the connection, or the pre-<c>AUTH</c> timeout elapses.
     /// </summary>
+    /// <remarks>
+    /// <b>Blocks a thread</b> (playbook § 7, spec 011 R11.10): a caught-up <c>PULL</c> waits on the primary for a change,
+    /// up to <c>LongPollMax</c>, with <c>Monitor.Wait</c> on the thread serving this connection (a thread-pool thread),
+    /// rather than an asynchronous wait: the wait must also be woken by commits made on writers' threads, and one thread
+    /// per standby connection, bounded by <c>MaxConnections</c>, is the cost accepted. Reads and writes of the stream
+    /// are asynchronous.
+    /// </remarks>
     public async Task ServeAsync(CancellationToken cancellationToken)
     {
         // One deadline from the moment the connection is served, not restarted by each request (003 should-fix 8): a
         // peer that keeps sending HELLO without authenticating is closed when it runs out.
         using var preAuth = new CancellationTokenSource(_preAuthTimeout);
-        _preAuthDeadline = preAuth.Token;
+        _preAuthDeadline = _givenPreAuthDeadline ?? preAuth.Token;
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var cap = _authenticated ? ReplicationProtocol.RequestCap : ReplicationProtocol.PreAuthFrameCap;
+                var cap = _authenticated ? _requestCap : ReplicationProtocol.PreAuthFrameCap;
                 var request = await ReadRequestAsync(cap, cancellationToken).ConfigureAwait(false);
                 if (request is null)
                 {
@@ -84,6 +117,13 @@ internal sealed class ReplicationConnection
         catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
         {
             // A dropped or cancelled connection is normal; nothing to log but the loss.
+        }
+        finally
+        {
+            if (_authenticated && _logger is not null)
+            {
+                Observability.CrystalLog.ReplicationDisconnected(_logger, _source.Epoch, $"{_peerNodeId} at {_remote}");
+            }
         }
     }
 
@@ -147,6 +187,25 @@ internal sealed class ReplicationConnection
         }
 
         _peerNodeId = Text.UTF8.GetString(request[2]);
+        if (!ReplicationProtocol.IsValidNodeId(_peerNodeId))
+        {
+            await WriteAsync(
+                new RespWriter().Error($"{ReplicationProtocol.ErrArg} HELLO node id must be 1 to {ReplicationProtocol.MaxNodeIdBytes} bytes"),
+                ct).ConfigureAwait(false);
+            return false;
+        }
+
+        // A peer stating this node's own id is refused (spec 011 R1.3): it can only be a relay reflecting this node's own
+        // follower, and is never an honest peer.
+        if (string.Equals(_peerNodeId, _source.NodeId, StringComparison.Ordinal))
+        {
+            await WriteAsync(
+                new RespWriter().Error($"{ReplicationProtocol.ErrAuth} the peer states this node's own id"),
+                ct).ConfigureAwait(false);
+            _logger?.LogWarning("Replication HELLO from {Remote} stated this node's own id; refused.", _remote);
+            return false;
+        }
+
         var peerRole = Text.UTF8.GetString(request[3]);
         if (!TryParseLong(request[4], out var peerEpoch) || peerEpoch < 0 || peerEpoch > ReplicationProtocol.MaxEpoch)
         {
@@ -218,7 +277,8 @@ internal sealed class ReplicationConnection
             return false;
         }
 
-        var expected = ReplicationProtocol.Response(_source.Secret, _nonce, _peerNodeId);
+        var serverNonce = _nonce;
+        var expected = ReplicationProtocol.ClientAnswer(_source.Secret, serverNonce, peerNonce, _peerNodeId, _source.NodeId);
         var actual = Text.ASCII.GetString(request[1]);
 
         // The nonce is spent whether or not the response is right: no second guess on this connection.
@@ -237,13 +297,20 @@ internal sealed class ReplicationConnection
         }
 
         _authenticated = true;
+        _onAuthenticated?.Invoke();
+        if (_logger is not null)
+        {
+            // Connected (spec 011 R10.2), and lost when ServeAsync ends: node id and endpoint only (R10.9).
+            Observability.CrystalLog.ReplicationConnected(_logger, _source.Epoch, $"{_peerNodeId} at {_remote} authenticated");
+        }
 
         // R6.3/R6.4, now that the peer has proved it holds the secret: adopt a higher epoch (a primary here demotes), or
         // report an equal-epoch conflict with another primary.
-        _source.ObservePeer(_peerEpoch, _peerRole, _peerNodeId);
+        _source.ObservePeer(_peerEpoch, _peerRole, _peerNodeId, _remote);
 
         // This node's proof in turn: the peer authenticates it too.
-        await WriteAsync(new RespWriter().BulkString(Text.ASCII.GetBytes(ReplicationProtocol.Proof(_source.Secret, peerNonce, _source.NodeId))), ct).ConfigureAwait(false);
+        var proof = ReplicationProtocol.ServerProof(_source.Secret, serverNonce, peerNonce, _peerNodeId, _source.NodeId);
+        await WriteAsync(new RespWriter().BulkString(Text.ASCII.GetBytes(proof)), ct).ConfigureAwait(false);
         return true;
     }
 
@@ -281,6 +348,11 @@ internal sealed class ReplicationConnection
                 if (status == RespReadStatus.ProtocolError)
                 {
                     // Close without answering: the peer cannot be trusted to read a reply (design § 8.1).
+                    if (_authenticated && error is not null && error.Contains("byte", StringComparison.Ordinal))
+                    {
+                        FrameRefused(cap, error);
+                    }
+
                     return null;
                 }
             }
@@ -308,6 +380,11 @@ internal sealed class ReplicationConnection
             // A frame that has already overrun the cap without parsing is refused.
             if (_bufferEnd - _bufferStart > cap + 16)
             {
+                if (_authenticated)
+                {
+                    FrameRefused(cap, "the frame overran it");
+                }
+
                 return null;
             }
         }

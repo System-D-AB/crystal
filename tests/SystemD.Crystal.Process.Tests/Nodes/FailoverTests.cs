@@ -15,6 +15,7 @@ public sealed class FailoverTests
 {
     private const int FailoverCycles = 20;
     private const int Kills = 20;
+    private const int KeysPerBatch = 5;
     private static readonly string[] Databases = ["alpha", "beta", "gamma"];
     private static readonly TimeSpan CatchUp = TimeSpan.FromSeconds(60);
 
@@ -105,7 +106,9 @@ public sealed class FailoverTests
     /// <summary>
     /// R14.2: a standby hard-killed while it applies the primary's stream comes back holding a whole prefix of that
     /// stream — every batch whole, none missing before the last it holds — and re-follows to byte-identical. 20 kills,
-    /// each at a different moment, while the primary keeps writing.
+    /// each at a different moment, while the primary keeps writing. Each batch holds several keys (spec 011 R12.2: with
+    /// one key a batch, a torn page would still look like a whole prefix; with five, it shows as a batch missing keys),
+    /// and the writer runs ahead of the standby, so its pages hold several batches.
     /// </summary>
     [Fact]
     public async Task TwentyHardKillsOfAFollowingStandby_EachLeaveAWholePrefix_ThatReFollowsToByteIdentical()
@@ -122,10 +125,10 @@ public sealed class FailoverTests
         using var stop = new CancellationTokenSource();
         var writer = Task.Run(() =>
         {
-            // One row per batch, keys in order: a whole prefix is k00000 … k(n-1) with no gap.
+            // Five rows per batch, batches in order: a whole prefix is batches 0 … n-1, each with all five keys.
             while (!stop.IsCancellationRequested)
             {
-                primary.Put("db", "box", $"k{written:D5}", $"v{written:D5}");
+                primary.PutBatch("db", "box", $"b{written:D5}", KeysPerBatch);
                 Interlocked.Increment(ref written);
             }
         });
@@ -151,9 +154,11 @@ public sealed class FailoverTests
                     keys = [];
                 }
 
+                // Keys sort as b00000-0 … b00000-4, b00001-0 …: a whole prefix of whole batches is exactly that sequence.
+                Assert.True(keys.Length % KeysPerBatch == 0, $"a batch was torn: {keys.Length} keys is not a whole number of batches");
                 for (var i = 0; i < keys.Length; i++)
                 {
-                    Assert.Equal($"k{i:D5}", keys[i]);
+                    Assert.Equal($"b{i / KeysPerBatch:D5}-{i % KeysPerBatch}", keys[i]);
                 }
 
                 standby.Follow(primary);

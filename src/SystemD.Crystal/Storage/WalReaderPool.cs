@@ -263,8 +263,31 @@ internal sealed class WalReaderPool : IDisposable
         }
     }
 
-    /// <summary>Drops every held reader (epoch or role change: a new history, like the tail).</summary>
+    /// <summary>Test hook (spec 011 R6.3): runs after <see cref="Clear"/> took the idle readers, before it closes them.</summary>
+    internal Action? OnClearTaken { get; set; }
+
+    /// <summary>
+    /// Drops every held reader (epoch or role change: a new history, like the tail). Under the expiry gate, as
+    /// <see cref="Dispose"/> is (spec 011 R6.2): closing a reader calls into the database's native instance, so a close of
+    /// the database waits for a clear in progress, and no clear closes a reader after the pool is disposed.
+    /// </summary>
     public void Clear()
+    {
+        lock (_expiryGate)
+        {
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+            }
+
+            CloseIdle();
+        }
+    }
+
+    private void CloseIdle()
     {
         List<WalReader> drop;
         lock (_lock)
@@ -278,6 +301,7 @@ internal sealed class WalReaderPool : IDisposable
             _idle.Clear();
         }
 
+        OnClearTaken?.Invoke();
         foreach (var r in drop)
         {
             Close(r);
@@ -299,7 +323,7 @@ internal sealed class WalReaderPool : IDisposable
                 _disposed = true;
             }
 
-            Clear();
+            CloseIdle();
         }
     }
 }

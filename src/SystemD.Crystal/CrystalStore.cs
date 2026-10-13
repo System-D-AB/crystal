@@ -80,6 +80,7 @@ public sealed class CrystalStore : IDisposable
         Directory.CreateDirectory(fullPath);
         var storeLock = StoreLock.Acquire(fullPath);
         StoreEngine? engine = null;
+        CrystalStore? store = null;
 
         try
         {
@@ -93,10 +94,15 @@ public sealed class CrystalStore : IDisposable
                 CrystalLog.StoreOpened(logger, fullPath, nodeId, options.Durability);
             }
 
-            return new CrystalStore(fullPath, nodeId, storeLock, engine, options.Replication, options.MeterFactory, logger);
+            store = new CrystalStore(fullPath, nodeId, storeLock, engine, options.Replication, options.MeterFactory, logger);
+
+            // A rejoin scheduled before this start follows its primary now (spec 011 R11.4), once the store is whole.
+            store._replication.ResumeScheduledRejoin();
+            return store;
         }
         catch
         {
+            store?._replication.Dispose(); // its event thread and meter, when the rejoin at open failed (review M6)
             engine?.Dispose();
             storeLock.Dispose();
             throw;
@@ -126,6 +132,7 @@ public sealed class CrystalStore : IDisposable
         if (replicated)
         {
             using var admitted = AdmitIfPrimary(_engine.WriteGate, $"create replicated database '{name}'");
+            _engine.RunHook("create.admitted");
             return _engine.CreateDatabase(this, name, replicated);
         }
 
@@ -254,7 +261,7 @@ public sealed class CrystalStore : IDisposable
         if (refusedAs is { } role)
         {
             throw new NotPrimaryException(
-                $"Cannot {operation}: this node is a {role}, not the primary, and the set of replicated databases is the " +
+                $"Cannot {operation}: this node is {role}, and the set of replicated databases is the " +
                 "primary's (R1.4, R1.6). Do it on the primary, or promote this node.");
         }
 

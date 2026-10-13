@@ -69,10 +69,12 @@ internal sealed class BatchApplier
 
     /// <summary>
     /// Applies one pull page for this database. Refuses the whole page (writes nothing) when <paramref name="epoch"/>
-    /// is below <see cref="SeenEpoch"/> (R4.3); otherwise skips batches already applied and writes the rest as one
-    /// synced write when they form a contiguous run, or batch by batch otherwise.
+    /// is below <see cref="SeenEpoch"/> (R4.3) or does not continue the database (003 should-fix 7); otherwise skips
+    /// batches already applied and writes the rest as one synced write. <paramref name="accepted"/> runs once the page
+    /// is accepted, before anything is written, also for a page with nothing new (spec 011 R2.1: the follow record is
+    /// written there, so a crash after the write never leaves a record older than the data).
     /// </summary>
-    public ApplyResult ApplyPage(ulong epoch, IReadOnlyList<(ulong Seq, byte[] Data)> batches)
+    public ApplyResult ApplyPage(ulong epoch, IReadOnlyList<(ulong Seq, byte[] Data)> batches, Action? accepted = null)
     {
         ArgumentNullException.ThrowIfNull(batches);
 
@@ -123,25 +125,26 @@ internal sealed class BatchApplier
 
         if (fresh.Count == 0)
         {
+            accepted?.Invoke();
             return new ApplyResult(ApplyStatus.Applied, 0, skipped, TouchedCatalogue: false, _target.Watermark);
         }
 
         // R4.5 is decided here from the bytes, before the write, so the follower can reload the catalogue after.
         touchedCatalogue = fresh.Exists(TouchesCatalogue);
 
+        // One synced write for the whole contiguous page (066 C2), assembled before the page is accepted.
+        byte[] page;
         if (fresh.Count == 1)
         {
-            _target.ApplyRaw(fresh[0]);
+            page = fresh[0];
         }
-        else if (TryConcat(fresh, out var page))
-        {
-            _target.ApplyRaw(page); // one synced write for the whole contiguous page (066 C2)
-        }
-        else
+        else if (!TryConcat(fresh, out page))
         {
             return NotContiguous();
         }
 
+        accepted?.Invoke();
+        _target.ApplyRaw(page);
         SyncedWrites++;
         return new ApplyResult(ApplyStatus.Applied, fresh.Count, skipped, touchedCatalogue, _target.Watermark);
 

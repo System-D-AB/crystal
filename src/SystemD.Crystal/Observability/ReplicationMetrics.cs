@@ -1,9 +1,11 @@
+// Ported from Highway: src/Highway.Server/Observability/HighwayMetrics.cs (replication instruments)
 // Spec 003 R13.1 — replication instruments on 007's meter (SystemD.Crystal), under crystal.replication.*. Counters
 // cost a branch when nobody listens; the role and epoch are observable gauges read only when a listener collects.
 // No tag carries a key, a value or a secret (the architecture gate). Fed from CrystalReplication's event sink.
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Diagnostics.Metrics;
 
 namespace SystemD.Crystal.Observability;
@@ -28,6 +30,9 @@ internal sealed class ReplicationMetrics : IDisposable
     private readonly Counter<long> _bootstraps;
     private readonly Counter<long> _pagesApplied;
     private readonly Counter<long> _bytesApplied;
+    private readonly Counter<long> _framesRefused;
+    private readonly Counter<long> _bytesShipped;
+    private readonly Func<IReadOnlyList<FollowedDatabase>> _followed;
 
     private readonly Func<long> _epoch;
     private readonly Func<string> _role;
@@ -40,12 +45,14 @@ internal sealed class ReplicationMetrics : IDisposable
     /// <param name="epoch">This node's epoch, read when a listener collects.</param>
     /// <param name="role">This node's role, read when a listener collects.</param>
     /// <param name="slots">The primary's slots (empty elsewhere), read only when a listener collects.</param>
+    /// <param name="followed">The databases a standby follows with their lag (empty elsewhere), read when a listener collects.</param>
     /// <param name="databaseName">A database's name from its UID, for tags when <paramref name="tagWithDatabase"/>.</param>
     /// <param name="tagWithDatabase">Lag per database, tagged with its name (007 R1.3), instead of the store's worst.</param>
     public ReplicationMetrics(
         IMeterFactory? factory, string nodeId, Func<long> epoch, Func<string> role,
-        Func<IReadOnlyList<ReplicationSlot>> slots, Func<string, string?> databaseName, bool tagWithDatabase)
+        Func<IReadOnlyList<ReplicationSlot>> slots, Func<IReadOnlyList<FollowedDatabase>> followed, Func<string, string?> databaseName, bool tagWithDatabase)
     {
+        _followed = followed ?? throw new ArgumentNullException(nameof(followed));
         _epoch = epoch ?? throw new ArgumentNullException(nameof(epoch));
         _role = role ?? throw new ArgumentNullException(nameof(role));
         _slots = slots ?? throw new ArgumentNullException(nameof(slots));
@@ -72,6 +79,10 @@ internal sealed class ReplicationMetrics : IDisposable
         _bootstraps = _meter.CreateCounter<long>("crystal.replication.bootstraps", "{bootstrap}", "Snapshot bootstraps installed (R7).");
         _pagesApplied = _meter.CreateCounter<long>("crystal.replication.pages_applied", "{page}", "Pull pages applied on a standby (R4).");
         _bytesApplied = _meter.CreateCounter<long>("crystal.replication.bytes_applied", "By", "WAL bytes applied on a standby (R4).");
+        _bytesShipped = _meter.CreateCounter<long>("crystal.replication.bytes_shipped", "By", "Batch bytes a primary sent in pull replies (spec 011 R10.1, 003 R13.1).");
+        _meter.CreateObservableGauge("crystal.replication.standby_lag", StandbyLag, "{sequence}",
+            "Sequences this standby lacks of its primary's latest, from the last reply (spec 011 R10.4): the worst, or per database when tagged.");
+        _framesRefused = _meter.CreateCounter<long>("crystal.replication.frames_refused", "{frame}", "Frames refused for exceeding a size cap, by the side that refused them (spec 011 R4.3).");
 
         _meter.CreateObservableGauge("crystal.replication.epoch", () => _epoch(), "{epoch}", "This node's current replication epoch (R6).");
         _meter.CreateObservableGauge("crystal.replication.role", RoleCode, "{role}", "This node's role: 0 primary, 1 standby, 2 fenced.");
@@ -145,6 +156,34 @@ internal sealed class ReplicationMetrics : IDisposable
 
     /// <summary>A snapshot bootstrap installed (R13.1).</summary>
     public void Bootstrapped() => _bootstraps.Add(1);
+
+    /// <summary>Batch bytes a primary put in a pull reply (spec 011 R10.1).</summary>
+    public void BytesShipped(long bytes)
+    {
+        if (bytes > 0)
+        {
+            _bytesShipped.Add(bytes);
+        }
+    }
+
+    private IEnumerable<Measurement<long>> StandbyLag()
+    {
+        var followed = _followed();
+        if (!_tagWithDatabase)
+        {
+            yield return new Measurement<long>(followed.Count == 0 ? 0 : followed.Max(f => f.Lag));
+            yield break;
+        }
+
+        foreach (var f in followed)
+        {
+            yield return new Measurement<long>(f.Lag, new KeyValuePair<string, object?>("crystal.database", f.Name));
+        }
+    }
+
+    /// <summary>A frame refused for exceeding a cap (spec 011 R4.3), by the side that refused it.</summary>
+    public void FrameRefused(string side) =>
+        _framesRefused.Add(1, new KeyValuePair<string, object?>("crystal.side", side));
 
     /// <summary>Counts an event raised through <see cref="CrystalReplication.Events"/> (R13.1).</summary>
     public void Observe(ReplicationEventKind kind)

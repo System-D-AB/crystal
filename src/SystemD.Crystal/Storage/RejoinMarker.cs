@@ -1,3 +1,4 @@
+// Ported from Highway: src/Highway.Server/Storage/Rocks/RocksDbStore.cs (WipeForRejoin: the rejoin marker)
 // Spec 003 R7.8, R9.1 — the node-wide rejoin marker under {dataDir}/replication/rejoin. A demoting node (or an
 // operator) records "on next start, wipe this node's replicated databases and bootstrap from this primary". The
 // marker survives a failed download, so a restart retries the rejoin; it is consumed only once the node is following

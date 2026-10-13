@@ -155,6 +155,6 @@ internal static class StoreFormat
             stream.Flush(flushToDisk: true);
         }
 
-        File.Move(temp, path, overwrite: true);
+        DurableFile.Replace(temp, path); // the rename made durable (spec 011 R9.1)
     }
 }

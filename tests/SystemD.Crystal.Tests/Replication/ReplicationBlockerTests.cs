@@ -434,6 +434,7 @@ public sealed class ReplicationBlockerTests
         WaitUntil(() => standby.OpenDatabase("db").Slot.LatestSequence == rdb.Slot.LatestSequence, TimeSpan.FromSeconds(30));
 
         Assert.Equal(Rows(rdb), Rows(standby.OpenDatabase("db")));
+        EventDelivery.Drain(standby);
         lock (events)
         {
             Assert.DoesNotContain(events, e => e.Kind is ReplicationEventKind.Divergence or ReplicationEventKind.Gap);

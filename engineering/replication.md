@@ -40,8 +40,9 @@ live in `SystemD.Crystal.Replication`; the public control is `SystemD.Crystal.Cr
 src/SystemD.Crystal/
   CrystalReplication.cs            store.Replication: Listen, Follow, Promote, Demote, Fence, ScheduleRejoin, Status, Events
   ReplicationEvent.cs              the events a product subscribes to (R9.3)
+  ReplicationEventPump.cs          delivers them on Crystal's own thread, in order (spec 011 R5.2)
   Replication/
-    ReplicationProtocol.cs         version 1 constants: commands, error codes, roles, caps, the HMAC challenge
+    ReplicationProtocol.cs         version 2 constants: commands, error codes, roles, caps, the HMAC challenge
     Resp/RespReader.cs, RespWriter.cs   the RESP2 subset, both sides (reply reader is Crystal's own)
     ReplicationListener.cs         TCP accept, optional TLS, client-cert validation
     ReplicationConnection.cs       the server state machine over a Stream: HELLO→AUTH gate, dispatch, frame caps
@@ -159,7 +160,11 @@ while it waited answers `CRYSTAL_NOTPRIMARY`, so no reply is stamped with a hist
   Such a page is refused whole, writing nothing, and the database re-bootstraps. A contiguous run is concatenated into
   **one synced write per page** through the one commit point (`RocksInstance.Write`), so a crash keeps the whole page
   or none; a page below the seen epoch is refused, writing nothing. If a page wrote box 0 the catalogue is
-  reloaded (`DatabaseContext.LoadCatalogue`). After the write, `follow/{uid}.json` is recorded if it changed.
+  reloaded (`DatabaseContext.LoadCatalogue`). `follow/{uid}.json` is recorded, if it changed, once the page is
+  accepted and **before** its write: the follower has just shown that what the database holds lies in the served log,
+  so the record is true before the write and after, and a crash can never leave it naming an older incarnation than
+  the data (which a promotion would claim as shared past its end). An install removes the old record, durably, before
+  it moves the snapshot in, and the follower writes the snapshot's after.
 - **A standby refuses every local write** while it follows a database (`DatabaseContext.FollowingPrimary` →
   `NotPrimaryException`); the applier's own writes go through `WalAccess.ApplyRaw`, which does not pass that path.
 - **Gap:** the retained WAL no longer reaches the standby's position → that database re-bootstraps; the others keep
@@ -196,11 +201,26 @@ The standby downloads each file in **1 MiB chunks** into a sibling `bootstrap-*`
 
 Then it checks the snapshot is the database asked for (spec 009), and **installs** it: close the database, move its
 old folder aside (`db-*.replaced-*`), move the snapshot in, and only then delete what was moved aside; if the snapshot
-cannot be moved in, the old folder goes back. It registers the record under the primary's UID, reopens, and records
-`follow/{uid}.json` from the snapshot's incarnation and base. **A bootstrap that fails is retried** on the follower's
+cannot be moved in, the old folder goes back. A database new to this node takes its id from the allocator **before**
+its folder is moved in, as a create does, so a crash after the move leaves an unregistered folder below the allocator,
+which recovery removes, never a folder at the next id that would block every later create. It registers the record
+under the primary's UID, reopens, and records `follow/{uid}.json` from the snapshot's incarnation and base. **Every
+rename that publishes state is followed by a sync of its directory** (`node.epoch`, follow and incarnation records,
+the store stamp, each folder move of an install or of recovery), so a power loss cannot undo it; on Windows the sync
+is a no-op, as .NET cannot flush a directory there and NTFS journals its metadata. **Downloads run beside the pull loop** (at most
+`MaxConcurrentBootstraps`, default 2), so a large snapshot never stalls the other databases; the loop alone installs a
+finished download and changes the followed set. A lost connection mid-download reconnects (up to 3 times) and
+continues the same session from the file and offset reached, keeping the bytes already written. The BEGIN reply's
+epoch is judged as a page's: older is refused, newer adopted. **A bootstrap that fails is retried** on the follower's
 own schedule (1, 2, 5, 10, 30 s), not only when the primary's set changes. At store open, recovery deletes leftover
 downloads and checkpoints, and puts back a database an install moved aside but never replaced. A format mismatch is
-refused before a byte is downloaded; an unreachable primary is retried with backoff. **The follower never stops on its
+refused before a byte is downloaded; an unreachable primary is retried with backoff. A standby gives up on a reply after 30 s (a PULL after its long poll and 30 s more) and reconnects, so a primary that
+vanished without closing the connection is not waited for forever. A finished download is checked against the
+primary's set as last parsed: a database the primary dropped meanwhile is discarded, a renamed one installed under its
+current name. A standby with nothing to follow sends a PULL naming no database, which long-polls on the primary until its set
+changes; it asks `DATABASES` only when a reply states a new set version, and always first on a new connection. `Follow`
+and `ScheduleRejoin` refuse an endpoint that is not `host:port` at once; a scheduled rejoin follows its endpoint when the
+store next opens. **The follower never stops on its
 own:** anything unexpected while following is logged, and it reconnects with backoff; only `StopFollowing`, promotion
 or fencing ends it.
 
@@ -215,13 +235,35 @@ admitted, so once it returns nothing local lands after it. The role survives a r
 fenced node comes back a standby too, since a restart ends the fence but never makes a node that stood down a primary
 again. **Promotion** stops following, gives every open database a new incarnation at what the node received, then
 increments the epoch and persists it with the role **before** the node accepts writes or serves (a persist failure
-fails the promotion with an `IOException`: epoch and role unchanged, no longer following), and clears the tails, readers and slots. A node adopts a **higher epoch** stated by an
+fails the promotion with an `IOException`: epoch and role unchanged, no longer following). A database marked for
+re-bootstrap for a divergence (or a rejoin) is given a fresh history, claiming nothing of the log it followed, since
+it may hold batches that log lacks; one marked for a gap continues it; a `PromotedWithPendingResync` event names them
+all, and the product decides whether to serve them. Promotion then clears the tails, readers and slots. A node adopts a **higher epoch** stated by an
 authenticated peer only, after `AUTH` (a primary or fenced node demotes to standby); an epoch above 2^62 is refused.
-**Two primaries at the same epoch** are reported as a conflict event with both node ids, and Crystal applies neither
-into the other. **Fence** makes a node read-only at once. **Demote** stands down, then writes a reconciliation report of what
-it committed beyond any standby's acknowledgement, decoded per box.
+**Two primaries at the same epoch** are reported as a conflict event with both node ids and endpoints, and Crystal
+applies neither into the other. A standby remembers the last primary it followed (`replication/primary.json`: node id,
+epoch, endpoint; written durably, so a restart does not forget it); a different node that states it is a primary at
+that same epoch is reported once and given nothing (no reconcile, no page), while the follower keeps retrying with
+backoff in case the product resolves it. A standby or fenced node at the same epoch is no conflict: every node of a
+healthy cluster shares the epoch. A primary also reports a peer that states it is a primary at its epoch; events
+caused by a peer carry `PeerNodeId` and `PeerEndpoint`. **A planned handover** (`StepDownAsync(standbyNodeId, timeout)`) is the step a product cannot do from outside: the
+primary refuses local writes at once (a step-down flag in the write gate, beside the role, so it keeps serving), waits
+for the writes already admitted, notes each replicated database's latest position, and waits until the named standby
+has acknowledged every one of them; then it demotes, with an empty report, and returns the positions. The product
+promotes that standby and points this node at it; this node continues without a re-bootstrap. A timeout or
+cancellation reopens writes and the node stays the primary; a role change meanwhile ends it. **Fence** makes a node
+read-only at once. **Demote** stands down, then writes a reconciliation report of what
+it committed beyond any standby's acknowledgement, decoded per box: for **every** replicated database (one no standby
+pulled is reported from position 0), measured from the position each standby **last** stated (a standby that
+re-bootstraps lower lowers its slot; a standby told it diverged stands at 0; a database a standby's PULL no longer
+names has no slot for it, so a standby re-bootstrapping a database is absent from `Status().Slots` for it until it
+follows it again). `SNAPSHOT BEGIN` is waited for up to 30 minutes, since the primary reads the whole checkpoint for
+its checksums before it answers; the TLS connect and handshake share the 30 s request deadline. A demotion caused by a peer's higher epoch writes one too, named in its `Demoted`
+event and in `LastReconciliationReport`.
 
-## 8. The wire protocol, version 1 (the inspection reference)
+## 8. The wire protocol, version 2 (the inspection reference)
+
+Version 2 (spec `011` R1) changed only what the `AUTH` MACs cover; version 1 peers are refused at `HELLO`.
 
 ### 8.1 Framing: a subset of RESP2
 
@@ -237,15 +279,19 @@ Requests are an array of bulk strings, the command first; numbers in requests ar
 per connection; a reply always precedes the next request. **Caps:** before `AUTH` a frame may not exceed 4 KiB and the
 connection closes 10 s after it was accepted if it has not authenticated (one deadline, not restarted by each
 request; it covers the TLS handshake too); the listener keeps at most `MaxConnections` (64) connections open and closes
-one more as soon as it is accepted; after `AUTH` a request may not exceed 64 KiB. A declared length above a
-cap, or any malformed frame, closes the connection without an answer.
+one more as soon as it is accepted; after `AUTH` a request may not exceed 4 KiB plus 128 bytes for each database
+the store can open (`MaxOpenDatabases`), and at least 64 KiB, so a PULL naming all of them fits. A reply may not
+exceed 64 MiB: a page is clamped to 16 MiB, and a batch over 32 MiB is never shipped (its database is reported
+`oversize` and re-bootstraps; the snapshot carries it). A declared length above a cap, or any malformed frame, closes
+the connection without an answer; a frame refused for its size is logged and counted
+(`crystal.replication.frames_refused`, by side).
 
 ### 8.2 Commands
 
 | Command | Request | Reply |
 |---|---|---|
 | `HELLO` | `HELLO <protocolVersion> <nodeId> <role> <epoch> <format> <layout>` | `[protocolVersion, nodeId, role, epoch, format, nonce]` |
-| `AUTH` | `AUTH <hmacHex> <ownNonceHex>` | bulk string: the server's proof, `hex(HMAC-SHA256(secret, ownNonce ‖ serverNodeId))` |
+| `AUTH` | `AUTH <answerHex> <clientNonceHex>` | bulk string: the server's proof (below) |
 | `DATABASES` | `DATABASES` | `[setVersion, [[uid, name, latest]…]]` |
 | `PULL` | `PULL <maxBytes> <waitMs> (<uid> <from>)…` | `[epoch, setVersion, [entry…]]` |
 | `SNAPSHOT BEGIN` | `SNAPSHOT BEGIN <uid> <format> <layout>` | `[epoch, uid, session, incarnation, base, checkpointSeq, [[file, size, crc32c]…], format]` |
@@ -254,8 +300,18 @@ cap, or any malformed frame, closes the connection without an answer.
 | `STATUS` | `STATUS` | bulk string: JSON of the node's replication status |
 
 - `role` is `primary`, `standby` or `fenced`; `format` is `crystal 1`; `layout` is `default,general,delete_heavy`.
-- `nonce` is 32 random bytes, hex; `hmacHex = hex(HMAC-SHA256(secret, nonce ‖ requesterNodeId))`. The secret never
-  crosses the wire; a nonce is valid for one `AUTH` on its connection only.
+- `nonce` is 32 random bytes, hex. The client's answer and the server's proof are
+  `hex(HMAC-SHA256(secret, label ‖ 0x00 ‖ serverNonce ‖ clientNonce ‖ id(client) ‖ id(server)))`, with `label`
+  `crystal-auth-client` for the answer and `crystal-auth-server` for the proof, and `id(x)` a 2-byte big-endian length
+  then the node id's UTF-8 bytes (1 to 256). Labelled by direction, a proof can never stand for an answer; bound to both
+  nonces and both ids, an answer belongs to one pairing of two named nodes. The secret never crosses the wire; a nonce
+  is valid for one `AUTH` on its connection only.
+- **A peer stating this node's own id is refused,** by the listener at `HELLO` and by the client on the `HELLO` reply,
+  before any `AUTH`. Such a peer can only be a relay reflecting the node's own follower to its own listener (the
+  reflection of the 2026-10-12 review), never an honest node.
+- **The secret alone does not protect against an active attacker on the path.** Over plain TCP, someone who can
+  intercept the connection can relay a genuine handshake and then alter what follows (pages, epochs), because nothing
+  binds the session after `AUTH` to it. **Use TLS on any network not trusted end to end.**
 - **TLS is optional, and both ways when on.** A node given a `Certificate` serves TLS on its listener and connects to
   its primary over TLS, presenting the same certificate when the primary requires one (`RequireClientCertificate`,
   mutual TLS). Every node of a cluster has a certificate or none, since a standby listens too. A peer's certificate
@@ -269,7 +325,7 @@ cap, or any malformed frame, closes the connection without an answer.
 - **A reply is read defensively.** Arrays may nest at most 16 deep, a declared array count must fit the frame cap at
   three bytes an element, and no array is sized from its declared count alone.
 - A **PULL entry** is `[uid, status, incarnation, base, latest, batchesOrGap, history]`, where `status` is `ok`,
-  `gap`, `diverged` or `gone`; for `ok`, `batchesOrGap` is `[[seq, bytes]…]` (possibly empty); for `gap`, it is the
+  `gap`, `diverged`, `gone` or `oversize`; for `ok`, `batchesOrGap` is `[[seq, bytes]…]` (possibly empty); for `gap`, it is the
   first available sequence as an integer; `history` is `[[incarnation, end]…]`, the earlier incarnations the log
   continues (possibly empty). An entry of another length is a protocol error.
 
@@ -293,6 +349,16 @@ Metrics on `007`'s meter under `crystal.replication.*`: counters for promotions,
 conflicts, gaps, divergences, slot drops, format refusals, bootstraps, pages and bytes applied; observable gauges for
 epoch and role, slots by state (`crystal.slot.state`), and the worst lag of the slots not dropped in sequences
 (`crystal.replication.lag`) and seconds (`crystal.replication.lag_time`), per database when `TagMetricsWithDatabase`
-is on. Log events in `CrystalLogEvents`' 2000s range, one per event of R9.3 plus connected/lost.
+is on, plus `bytes_shipped` (primary), `pages_applied`, `bytes_applied`, `bootstraps` and the gauge `standby_lag`
+(standby), and `frames_refused`. `Status().Followed` lists each database a standby follows with its position, the
+primary's latest from the last reply, and the lag. Log events in `CrystalLogEvents`' 2000s range, one per event of
+R9.3 plus connected/lost (2011/2012, on the follower and on the listener's authenticated connections). A standby that
+adopts a newer epoch from its primary (handshake, page or snapshot) raises `EpochChanged`. **Events are
+delivered on Crystal's own thread** (`ReplicationEventPump`), one at a time and in order, never on the thread that
+raised them: a handler may run after the call that caused it has returned, and may call any `store.Replication`
+member, including `Promote` from a handler of an event the follower raised (which used to deadlock: `Promote` waits
+for the follower to stop). A handler that throws is logged (event 2014) and the next event is still delivered;
+disposing the store delivers what is queued, waiting at most 5 s. The facade's members still take its lock, so a
+call made while a `Promote` or `Demote` runs waits for it to finish.
 `store.Replication.Status()` reports role, epoch, the followed primary, the listener endpoint, a bounded log of recent
 transitions and, on a primary, every slot with its lag and state; the protocol's `STATUS` returns the same as JSON.

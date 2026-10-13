@@ -103,7 +103,7 @@ internal static class IncarnationRecord
             stream.Flush(flushToDisk: true);
         }
 
-        File.Move(temp, path, overwrite: true);
+        DurableFile.Replace(temp, path); // the rename made durable (spec 011 R9.1)
     }
 
     /// <summary>Whether a record exists for <paramref name="uid"/>.</summary>

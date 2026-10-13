@@ -112,6 +112,43 @@ internal sealed class WalAccess
     }
 
     /// <summary>
+    /// The first sequence the WAL still holds, or null when it holds none (everything lives in table files). Read with
+    /// file deletion held, so the file it is read from cannot go while it is read (spec 011 R11.2). Unlike a page read,
+    /// a first batch above the start is not a gap here: it is the answer.
+    /// </summary>
+    internal ulong? EarliestSequence()
+    {
+        _db.DisableFileDeletions();
+        try
+        {
+            TransactionLogIterator iterator;
+            try
+            {
+                iterator = _db.GetUpdatesSince(1);
+            }
+            catch (RocksDbException)
+            {
+                return null;
+            }
+
+            using (iterator)
+            {
+                if (!iterator.Valid())
+                {
+                    return null;
+                }
+
+                using var batch = iterator.GetBatch(out var first);
+                return first;
+            }
+        }
+        finally
+        {
+            _db.EnableFileDeletions();
+        }
+    }
+
+    /// <summary>
     /// Whether the WAL can still serve everything after <paramref name="fromSequence"/> (the R4.1 check,
     /// without opening a tail to keep). A gone range is reported as <c>false</c>, never a crash.
     /// </summary>

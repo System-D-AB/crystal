@@ -368,6 +368,14 @@ internal static class RespReader
             return false;
         }
 
+        if (length < -1)
+        {
+            // -1 is RESP's null; any other negative length is malformed (spec 011 R11.7), never read as null.
+            error = $"RESP length {length} is negative";
+            status = RespReadStatus.ProtocolError;
+            return false;
+        }
+
         status = RespReadStatus.Complete;
         return true;
     }
@@ -447,6 +455,10 @@ internal static class RespReader
             }
         }
 
+        // Checked against the signed range (spec 011 R11.7): a number past 64 bits is a protocol error, never a silently
+        // wrapped value. The magnitude is kept unsigned, as long.MinValue's is one more than long.MaxValue.
+        var limit = negative ? (ulong)long.MaxValue + 1 : long.MaxValue;
+        ulong magnitude = 0;
         for (; i < digits.Length; i++)
         {
             var d = digits[i];
@@ -455,14 +467,16 @@ internal static class RespReader
                 return false;
             }
 
-            value = (value * 10) + (d - (byte)'0');
+            var digit = (ulong)(d - (byte)'0');
+            if (magnitude > (limit - digit) / 10)
+            {
+                return false;
+            }
+
+            magnitude = (magnitude * 10) + digit;
         }
 
-        if (negative)
-        {
-            value = -value;
-        }
-
+        value = negative ? (long)(0 - magnitude) : (long)magnitude;
         return true;
     }
 

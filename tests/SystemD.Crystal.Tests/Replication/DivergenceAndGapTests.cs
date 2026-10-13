@@ -102,6 +102,48 @@ public sealed class DivergenceAndGapTests
     }
 
     [Fact]
+    public void AGap_ReportsTheFirstSequenceTheWalStillHolds()
+    {
+        // Spec 011 R11.2: after WAL files are purged, the first available sequence is the WAL's earliest, not latest+1.
+        using var dir = new TempStoreDirectory();
+        using var store = CrystalStore.Open(dir.Path, Options(listen: null, walTtl: TimeSpan.FromSeconds(1), walBytes: 0, tailBytes: 1 << 20));
+        var epoch = ReplicationEpoch.Load(dir.Path, SystemD.Crystal.Storage.ReplicationRole.Primary);
+        using var source = new ReplicationSource(store, store.Engine, store.NodeId, epoch, Options(listen: null).Replication!);
+        var db = store.CreateDatabase("db", replicated: true);
+        var box = db.Boxes.Create("box");
+        Write(db, box, "k0000", "v");
+        var early = (long)db.Slot.LatestSequence;
+
+        var wal = new WalAccess(db.Slot.Instance);
+        var value = new string('v', 4096);
+        var i = 1;
+        WaitUntil(() =>
+        {
+            for (var n = 0; n < 400; n++, i++)
+            {
+                Write(db, box, $"k{i:D5}", value);
+            }
+
+            db.Slot.Instance.Flush();
+            Thread.Sleep(600);
+            return !wal.WalHolds((ulong)early);
+        }, TimeSpan.FromSeconds(60));
+        Assert.False(wal.WalHolds((ulong)early));
+
+        // Batches written now live in the current WAL file: its first is what a gap must report.
+        var before = (long)db.Slot.LatestSequence;
+        Write(db, box, "after-a", "x");
+        Write(db, box, "after-b", "x");
+        var serving = source.ServingForTest(db.Uid)!;
+        var first = serving.FirstAvailable();
+
+        Assert.True(first <= before + 1, $"the first available sequence {first} is past the WAL's batches (latest {db.Slot.LatestSequence})");
+        Assert.True(first > early, "the purged range is not reported as available");
+        // (Not checked: that the WAL still serves from it a moment later. With a one-second TTL, RocksDB purges archived
+        // WAL files twice a second; the live file, which holds the last writes, is not purged before a flush.)
+    }
+
+    [Fact]
     public void ResyncMarker_PersistsUntilCleared()
     {
         using var dir = new TempStoreDirectory();
@@ -165,6 +207,7 @@ public sealed class DivergenceAndGapTests
         standby.Replication.Follow(primary.Replication.ListenerEndpoint!);
         WaitUntil(() => standby.OpenDatabase("db").Slot.LatestSequence >= db.Slot.LatestSequence, TimeSpan.FromSeconds(60));
 
+        EventDelivery.Drain(standby);
         lock (events)
         {
             Assert.Contains(events, e => e.Kind == ReplicationEventKind.Gap && e.Uid == db.Uid);
@@ -219,6 +262,7 @@ public sealed class DivergenceAndGapTests
 
         primary.Replication.Promote("past the split");
         primary.Replication.Promote("past the split");
+        EventDelivery.Drain(standby);
         lock (events)
         {
             events.Clear();
@@ -230,6 +274,7 @@ public sealed class DivergenceAndGapTests
 
         AssertByteIdentical(a, standby.OpenDatabase("alpha"));
         AssertByteIdentical(b, standby.OpenDatabase("beta"));
+        EventDelivery.Drain(standby);
         lock (events)
         {
             Assert.Contains(events, e => e.Kind == ReplicationEventKind.Divergence && e.Uid == a.Uid);

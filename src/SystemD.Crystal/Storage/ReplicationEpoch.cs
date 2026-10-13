@@ -113,10 +113,17 @@ internal sealed class ReplicationEpoch
     /// </summary>
     public Action<ReplicationRole>? RoleChanged { get; set; }
 
+    /// <summary>
+    /// Called after every role change, with the new role, once the lock is released (spec 011 R5.1): the place for work
+    /// that may wait on other threads, such as the write gate's wait for admitted writes. The call that changed the role
+    /// returns only after it.
+    /// </summary>
+    public Action<ReplicationRole>? AfterRoleChanged { get; set; }
+
     /// <summary>The current epoch (lock-free read).</summary>
     public long Epoch => Interlocked.Read(ref _epoch);
 
-    /// <summary>The current role (lock-free read).</summary>
+    /// <summary>The current role (read under the lock, so it never sees a role the lock is changing).</summary>
     public ReplicationRole Role
     {
         get { lock (_gate) { return _role; } }
@@ -139,11 +146,18 @@ internal sealed class ReplicationEpoch
     {
         // Memory first, then disk: standing down (demote, fence, follow) takes effect at once even if the disk fails;
         // a failure to persist throws to the caller, whose node would otherwise come back with its old role.
-        lock (_gate)
+        try
         {
-            _role = role;
-            RoleChanged?.Invoke(role);
-            Persist(Interlocked.Read(ref _epoch));
+            lock (_gate)
+            {
+                _role = role;
+                RoleChanged?.Invoke(role);
+                Persist(Interlocked.Read(ref _epoch));
+            }
+        }
+        finally
+        {
+            AfterRoleChanged?.Invoke(role); // the role changed in memory even if the disk write failed
         }
     }
 
@@ -203,6 +217,7 @@ internal sealed class ReplicationEpoch
             newEpoch = target;
         }
 
+        AfterRoleChanged?.Invoke(role);
         return true;
     }
 
@@ -215,23 +230,35 @@ internal sealed class ReplicationEpoch
     public EpochTransition ObserveHigherEpoch(long observedEpoch)
     {
         EpochTransition transition;
-        lock (_gate)
+        var stoodDown = false;
+        try
         {
-            if (observedEpoch <= Interlocked.Read(ref _epoch))
+            lock (_gate)
             {
-                return EpochTransition.None;
-            }
+                if (observedEpoch <= Interlocked.Read(ref _epoch))
+                {
+                    return EpochTransition.None;
+                }
 
-            var wasPrimaryOrFenced = _role is ReplicationRole.Primary or ReplicationRole.Fenced;
-            if (wasPrimaryOrFenced)
+                var wasPrimaryOrFenced = _role is ReplicationRole.Primary or ReplicationRole.Fenced;
+                if (wasPrimaryOrFenced)
+                {
+                    _role = ReplicationRole.Standby; // stand down before the disk write: never a primary at a stale epoch
+                    RoleChanged?.Invoke(ReplicationRole.Standby);
+                    stoodDown = true;
+                }
+
+                Persist(observedEpoch);
+                Interlocked.Exchange(ref _epoch, observedEpoch);
+                transition = wasPrimaryOrFenced ? EpochTransition.Demoted : EpochTransition.Adopted;
+            }
+        }
+        finally
+        {
+            if (stoodDown)
             {
-                _role = ReplicationRole.Standby; // stand down before the disk write: never a primary at a stale epoch
-                RoleChanged?.Invoke(ReplicationRole.Standby);
+                AfterRoleChanged?.Invoke(ReplicationRole.Standby);
             }
-
-            Persist(observedEpoch);
-            Interlocked.Exchange(ref _epoch, observedEpoch);
-            transition = wasPrimaryOrFenced ? EpochTransition.Demoted : EpochTransition.Adopted;
         }
 
         return transition;
@@ -255,6 +282,6 @@ internal sealed class ReplicationEpoch
             stream.Flush(flushToDisk: true);
         }
 
-        File.Move(temp, _path, overwrite: true);
+        DurableFile.Replace(temp, _path); // the rename made durable (spec 011 R9.1)
     }
 }

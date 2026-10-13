@@ -1,3 +1,4 @@
+// Ported from Highway: src/Highway.Server/Storage/Rocks/ReplicationFeeder.cs (serving a pull from the tail or the WAL)
 // Spec 003 T7 / design § 3, § 4 — the primary's per-database serving state: the in-memory tail of recent commits, the
 // WAL read path, and the incarnation/base a standby checks for divergence. One per replicated database the primary
 // serves. RocksDB-touching (it owns a WalAccess and wires the commit hook), so it lives in Storage; the tail and the
@@ -189,16 +190,11 @@ internal sealed class DatabaseReplication
     /// <summary>The first available sequence when a gap is reported (design § 4): the WAL's earliest, or latest+1.</summary>
     public long FirstAvailable()
     {
-        // Probe from 0: the first record GetUpdatesSince can serve is the WAL's earliest retained sequence. If none,
-        // everything lives in SSTs past the live WAL — the standby's only path forward is a snapshot, so report
-        // latest+1 (nothing to pull).
-        var probe = new List<(ulong Seq, byte[] Data)>();
-        if (_wal.ReadPage(0, 1, probe) == WalPageStatus.Ok && probe.Count > 0)
-        {
-            return (long)probe[0].Seq;
-        }
-
-        return Latest + 1;
+        // The WAL's earliest retained sequence (spec 011 R11.2). A page read from 0 is no probe for it: once any WAL file
+        // was purged, the first batch it finds starts above 1, which a page read rightly calls a gap, so this reported
+        // latest+1 whatever the WAL held. If the WAL holds nothing, everything lives in table files: latest+1.
+        var latest = Latest;
+        return _wal.EarliestSequence() is { } earliest && (long)earliest <= latest ? (long)earliest : latest + 1;
     }
 
     /// <summary>Releases the commit hook and held readers so a dropped or demoted database stops serving.</summary>
@@ -219,6 +215,12 @@ internal sealed class DatabaseReplication
 
     /// <summary>Whether a held reader is pausing WAL file deletion now (design § 3 tests).</summary>
     internal bool HoldingWal => _readers.HoldingWal;
+
+    /// <summary>The held-reader pool's clear hook (spec 011 R6.3 tests).</summary>
+    internal Action? OnReadersClearTaken
+    {
+        set => _readers.OnClearTaken = value;
+    }
 }
 
 /// <summary>The outcome of serving one database in a pull (spec 003 design § 4).</summary>

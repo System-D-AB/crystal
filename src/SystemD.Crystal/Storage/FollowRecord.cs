@@ -116,7 +116,7 @@ internal sealed record FollowRecord
             stream.Flush(flushToDisk: true);
         }
 
-        File.Move(temp, path, overwrite: true);
+        DurableFile.Replace(temp, path); // the rename made durable (spec 011 R9.1)
     }
 
     /// <summary>Deletes the follow record for <paramref name="uid"/> (the database is no longer followed). Best effort.</summary>
@@ -130,5 +130,22 @@ internal sealed record FollowRecord
         {
             // Best effort: a stale follow record is re-checked, never trusted blindly.
         }
+    }
+
+    /// <summary>
+    /// Deletes the follow record for <paramref name="uid"/> and makes the deletion durable, throwing if it cannot be done
+    /// (spec 011 R2.2): before an install, a record that survived would be trusted by a promotion as the history of the
+    /// snapshot's data, so the install must not go ahead without its removal.
+    /// </summary>
+    public static void DeleteDurably(string dataDirectory, string uid)
+    {
+        var path = PathFor(dataDirectory, uid);
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        File.Delete(path);
+        DurableFile.SyncDirectory(Directory(dataDirectory));
     }
 }

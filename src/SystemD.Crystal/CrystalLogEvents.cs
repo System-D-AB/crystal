@@ -134,4 +134,10 @@ public static class CrystalLogEvents
 
     /// <summary>Information: a replication connection was lost.</summary>
     public static readonly EventId ReplicationDisconnected = new(2012, nameof(ReplicationDisconnected));
+
+    /// <summary>Warning: this node was promoted while some of its databases were marked for re-bootstrap (spec 011 R2.4).</summary>
+    public static readonly EventId ReplicationPromotedWithPendingResync = new(2013, nameof(ReplicationPromotedWithPendingResync));
+
+    /// <summary>Error: a handler of <c>CrystalReplication.Events</c> threw; the events after it are still delivered (spec 011 R5.3).</summary>
+    public static readonly EventId ReplicationEventHandlerFailed = new(2014, nameof(ReplicationEventHandlerFailed));
 }

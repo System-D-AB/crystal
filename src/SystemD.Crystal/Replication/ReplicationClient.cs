@@ -25,12 +25,19 @@ internal sealed class ReplicationClient
     private int _bufferStart;
     private int _bufferEnd;
 
-    public ReplicationClient(Stream stream, string nodeId, string secret)
+    public ReplicationClient(Stream stream, string nodeId, string secret, Action? onFrameRefused = null, TimeSpan? requestTimeout = null)
     {
+        _requestTimeout = requestTimeout;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _nodeId = nodeId ?? throw new ArgumentNullException(nameof(nodeId));
         _secret = secret ?? throw new ArgumentNullException(nameof(secret));
+        _onFrameRefused = onFrameRefused;
     }
+
+    private readonly Action? _onFrameRefused;
+
+    // The most any one reply is waited for (review 2026-10-13, S4); null: as long as the caller's token allows.
+    private readonly TimeSpan? _requestTimeout;
 
     /// <summary>The primary's node id, learned from the <c>HELLO</c> reply.</summary>
     public string PrimaryNodeId { get; private set; } = "unknown";
@@ -47,6 +54,21 @@ internal sealed class ReplicationClient
     /// format refusal, a failed AUTH, or an unexpected reply.
     /// </summary>
     public async Task HandshakeAsync(string role, long epoch, CancellationToken ct)
+    {
+        var timeout = _requestTimeout ?? Timeout.InfiniteTimeSpan;
+        using var deadline = _requestTimeout is null ? null : CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline?.CancelAfter(timeout);
+        try
+        {
+            await HandshakeCoreAsync(role, epoch, deadline?.Token ?? ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (deadline is not null && deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new ReplicationConnectionLostException($"no handshake reply from the primary within {timeout}");
+        }
+    }
+
+    private async Task HandshakeCoreAsync(string role, long epoch, CancellationToken ct)
     {
         // HELLO <protocolVersion> <nodeId> <role> <epoch> <format> <layout>
         await SendAsync(
@@ -73,6 +95,19 @@ internal sealed class ReplicationClient
         }
 
         PrimaryNodeId = Text.UTF8.GetString(fields[1].Bytes ?? []);
+        if (!ReplicationProtocol.IsValidNodeId(PrimaryNodeId))
+        {
+            throw new ReplicationProtocolException($"{ReplicationProtocol.ErrAuth} the peer stated no valid node id");
+        }
+
+        // A peer stating this node's own id is refused before anything else (spec 011 R1.3): it can only be this node's
+        // own listener, reached through a relay that reflects this node's answers back to it.
+        if (string.Equals(PrimaryNodeId, _nodeId, StringComparison.Ordinal))
+        {
+            throw new ReplicationProtocolException(
+                $"{ReplicationProtocol.ErrAuth} the peer states this node's own id ({_nodeId}); nothing is taken from it");
+        }
+
         PrimaryRole = Text.UTF8.GetString(fields[2].Bytes ?? []);
         PrimaryEpoch = fields[3].Integer;
         var nonceHex = Text.UTF8.GetString(fields[5].Bytes ?? []);
@@ -81,8 +116,8 @@ internal sealed class ReplicationClient
         // AUTH <hmacHex> <standbyNonceHex>: this node's answer to the primary's challenge, and its own challenge to the
         // primary, which must answer with its proof. Authentication goes both ways: a standby never takes pages, epochs
         // or snapshots from an endpoint that cannot show it holds the secret (003 should-fix 4).
-        var response = ReplicationProtocol.Response(_secret, nonce, _nodeId);
         var myNonce = ReplicationProtocol.NewNonce();
+        var response = ReplicationProtocol.ClientAnswer(_secret, nonce, myNonce, _nodeId, PrimaryNodeId);
         await SendAsync([Bytes(ReplicationProtocol.Auth), Bytes(response), Bytes(Convert.ToHexStringLower(myNonce))], ct).ConfigureAwait(false);
 
         var auth = await ReadReplyAsync(ct).ConfigureAwait(false);
@@ -91,7 +126,7 @@ internal sealed class ReplicationClient
             throw new ReplicationProtocolException(auth.Text ?? "AUTH refused");
         }
 
-        var expected = ReplicationProtocol.Proof(_secret, myNonce, PrimaryNodeId);
+        var expected = ReplicationProtocol.ServerProof(_secret, nonce, myNonce, _nodeId, PrimaryNodeId);
         var proof = auth.Type == RespType.BulkString ? Text.ASCII.GetString(auth.Bytes ?? []) : string.Empty;
         if (!ReplicationProtocol.ResponsesEqual(expected, proof))
         {
@@ -101,10 +136,27 @@ internal sealed class ReplicationClient
     }
 
     /// <summary>Sends a request (an array of bulk-string arguments) and reads the one reply (design § 8.1).</summary>
-    public async Task<RespValue> RequestAsync(IReadOnlyList<byte[]> args, CancellationToken ct)
+    public Task<RespValue> RequestAsync(IReadOnlyList<byte[]> args, CancellationToken ct) => RequestAsync(args, ct, extraWait: TimeSpan.Zero);
+
+    /// <summary>
+    /// Sends a request and reads its reply, allowing <paramref name="extraWait"/> beyond the request timeout (a PULL that
+    /// waits on the primary). No reply in time ends the exchange as a lost connection (review 2026-10-13, S4).
+    /// </summary>
+    public async Task<RespValue> RequestAsync(IReadOnlyList<byte[]> args, CancellationToken ct, TimeSpan extraWait)
     {
-        await SendAsync(args, ct).ConfigureAwait(false);
-        return await ReadReplyAsync(ct).ConfigureAwait(false);
+        var timeout = _requestTimeout ?? Timeout.InfiniteTimeSpan;
+        using var deadline = _requestTimeout is null ? null : CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline?.CancelAfter(timeout + extraWait);
+        var token = deadline?.Token ?? ct;
+        try
+        {
+            await SendAsync(args, token).ConfigureAwait(false);
+            return await ReadReplyAsync(token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (deadline is not null && deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new ReplicationConnectionLostException($"no reply from the primary within {timeout + extraWait}");
+        }
     }
 
     private async Task SendAsync(IReadOnlyList<byte[]> args, CancellationToken ct)
@@ -138,6 +190,11 @@ internal sealed class ReplicationClient
 
                 if (status == RespReadStatus.ProtocolError)
                 {
+                    if (error is not null && error.Contains("byte", StringComparison.Ordinal))
+                    {
+                        _onFrameRefused?.Invoke(); // a reply over the cap (spec 011 R4.3)
+                    }
+
                     throw new ReplicationProtocolException(error ?? "malformed reply from the primary");
                 }
             }
@@ -155,6 +212,7 @@ internal sealed class ReplicationClient
                 // the reader will have already rejected, so the buffer never exceeds the cap plus one grow step.
                 if (_buffer.Length >= ReplicationProtocol.ReplyFrameCap)
                 {
+                    _onFrameRefused?.Invoke(); // spec 011 R4.3
                     throw new ReplicationProtocolException(
                         $"the primary's reply exceeds the {ReplicationProtocol.ReplyFrameCap}-byte cap (R10.8)");
                 }
@@ -165,7 +223,7 @@ internal sealed class ReplicationClient
             var read = await _stream.ReadAsync(_buffer.AsMemory(_bufferEnd), ct).ConfigureAwait(false);
             if (read == 0)
             {
-                throw new ReplicationProtocolException("the primary closed the connection");
+                throw new ReplicationConnectionLostException("the primary closed the connection");
             }
 
             _bufferEnd += read;
@@ -177,3 +235,6 @@ internal sealed class ReplicationClient
 
 /// <summary>A replication protocol failure a standby cannot recover from on this connection (spec 003 R10).</summary>
 internal class ReplicationProtocolException(string message) : Exception(message);
+
+/// <summary>The connection ended mid-exchange (spec 011 R3.3: a snapshot download reconnects and resumes).</summary>
+internal sealed class ReplicationConnectionLostException(string message) : ReplicationProtocolException(message);

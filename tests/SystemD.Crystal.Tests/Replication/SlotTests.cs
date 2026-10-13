@@ -71,9 +71,11 @@ public sealed class SlotTests
 
         clock.Advance(TimeSpan.FromSeconds(60)); // the timer ages it; nobody pulls or reads the status
 
+        EventDelivery.Drain(primary);
         Assert.Single(events, e => e.Kind == ReplicationEventKind.SlotDropped);
         Assert.Equal(ReplicationSlotState.Dropped, primary.Replication.Status().Slots.Single().State);
         clock.Advance(TimeSpan.FromSeconds(60));
+        EventDelivery.Drain(primary);
         Assert.Single(events, e => e.Kind == ReplicationEventKind.SlotDropped); // once
     }
 
@@ -106,11 +108,13 @@ public sealed class SlotTests
         await standby.Pull(db.Uid, from: start);
         Assert.Equal(ReplicationSlotState.Lagging, primary.Replication.Status().Slots.Single().State);
         await standby.Pull(db.Uid, from: start);
+        EventDelivery.Drain(primary);
         Assert.Single(events, e => e.Kind == ReplicationEventKind.SlotLagging);
 
         Write(db, 90); // 120 behind: past the cap
         primary.Replication.Status();
         Assert.Equal(ReplicationSlotState.Dropped, primary.Replication.Status().Slots.Single().State);
+        EventDelivery.Drain(primary);
         Assert.Single(events, e => e.Kind == ReplicationEventKind.SlotDropped);
     }
 

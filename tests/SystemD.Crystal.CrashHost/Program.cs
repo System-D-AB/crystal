@@ -13,6 +13,7 @@ namespace SystemD.Crystal.CrashHost;
 /// create  {dir} {name} {step}           create a database
 /// drop    {dir} {name} {step}           drop a database
 /// rename  {dir} {name} {newName} {step} rename a database
+/// install {dir} {name} {uid} {snapshot} {step} install a downloaded snapshot as a new replicated database (spec 011 R9)
 /// reset   {dir} {step}                  reset the store
 /// hold    {dir}                         open the store, print OPEN, close it when stdin closes
 /// tryopen {dir}                         print LOCKED or OPENED
@@ -71,6 +72,9 @@ internal static class Program
                     break;
                 case "rename":
                     store.RenameDatabase(store.OpenDatabase(args[2]), args[3]);
+                    break;
+                case "install":
+                    store.Engine.InstallBootstrap(store, args[3], args[2], args[4]);
                     break;
                 default:
                     throw new ArgumentException($"Unknown command '{command}'.");

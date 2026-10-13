@@ -38,6 +38,13 @@ public enum ReplicationEventKind
 
     /// <summary>Two primaries at the same epoch were detected (R6.4): both ids and endpoints are in the detail.</summary>
     Conflict,
+
+    /// <summary>
+    /// This node was promoted while some of its databases were marked for re-bootstrap (spec 011 R2.4): the detail names
+    /// each and why. A database marked for a divergence was given a fresh history, so its other standbys re-bootstrap
+    /// from this node; the product decides whether to serve it.
+    /// </summary>
+    PromotedWithPendingResync,
 }
 
 /// <summary>
@@ -58,6 +65,12 @@ public sealed class ReplicationEvent(ReplicationEventKind kind, long epoch, stri
 
     /// <summary>The database UID the event concerns, if any (gaps, divergences, slots).</summary>
     public string? Uid { get; init; }
+
+    /// <summary>The other node's id, when a peer caused the event (a conflict, an epoch or demotion from a peer; spec 011 R7.3).</summary>
+    public string? PeerNodeId { get; init; }
+
+    /// <summary>The other node's endpoint, when known (spec 011 R7.3).</summary>
+    public string? PeerEndpoint { get; init; }
 
     /// <summary>A short, data-free rendering of the event (kind, epoch, detail).</summary>
     public override string ToString() => $"{Kind} epoch={Epoch} {Detail}";

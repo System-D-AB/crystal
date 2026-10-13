@@ -30,6 +30,9 @@ internal static class Program
         string? dir = null;
         var port = 0;
         var durability = DurabilityMode.Strict;
+        string? certificate = null;
+        string? trust = null;
+        var requireClient = false;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -42,6 +45,15 @@ internal static class Program
                     break;
                 case "--durability":
                     durability = Enum.Parse<DurabilityMode>(args[++i]);
+                    break;
+                case "--cert": // spec 011 T16: replication over TLS, the node's certificate (a PFX with its key)
+                    certificate = args[++i];
+                    break;
+                case "--trust": // the CA certificate peers must chain to
+                    trust = args[++i];
+                    break;
+                case "--require-client-cert":
+                    requireClient = true;
                     break;
             }
         }
@@ -57,6 +69,9 @@ internal static class Program
         {
             Secret = "crystal-test-secret",
             ListenEndpoint = $"127.0.0.1:{port.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            Certificate = certificate is null ? null : System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadPkcs12FromFile(certificate, null),
+            TrustedCertificates = trust is null ? null : [System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificateFromFile(trust)],
+            RequireClientCertificate = requireClient,
         };
         var store = CrystalStore.Open(dir, new CrystalOptions { Durability = durability, Replication = replication });
         var node = new Node(store);
@@ -154,6 +169,29 @@ internal static class Program
                         batch.Commit();
                     }
 
+                    return null;
+                }
+
+                case "stepdown": // spec 011 R14: hand over to the standby named, waiting up to 30 s
+                {
+                    var handedOver = store.Replication.StepDownAsync(Text(request, "standby"), TimeSpan.FromSeconds(30)).GetAwaiter().GetResult();
+                    return handedOver.Count;
+                }
+
+                case "putbatch":
+                {
+                    // Several keys in one batch: {prefix}-0 … {prefix}-(count-1) (spec 011 R12.2: a torn page is visible
+                    // only as a batch with some of its keys missing).
+                    var (db, box) = Box(request);
+                    var prefix = Text(request, "prefix");
+                    var count = int.Parse(Text(request, "count"), System.Globalization.CultureInfo.InvariantCulture);
+                    using var batch = db.NewBatch();
+                    for (var i = 0; i < count; i++)
+                    {
+                        batch.Put(box, System.Text.Encoding.UTF8.GetBytes($"{prefix}-{i}"), System.Text.Encoding.UTF8.GetBytes("v"));
+                    }
+
+                    batch.Commit();
                     return null;
                 }
 

@@ -29,8 +29,11 @@ internal sealed class StandbyDatabase
     private FollowRecord? _followRecord;
     private bool _followRecordLoaded;
 
-    public StandbyDatabase(DatabaseSlot slot, string uid, string dataDirectory, long initialEpoch = 0)
+    private readonly Action<string>? _hook;
+
+    public StandbyDatabase(DatabaseSlot slot, string uid, string dataDirectory, long initialEpoch = 0, Action<string>? hook = null)
     {
+        _hook = hook;
         _slot = slot ?? throw new ArgumentNullException(nameof(slot));
         _uid = uid ?? throw new ArgumentNullException(nameof(uid));
         _dataDirectory = dataDirectory ?? throw new ArgumentNullException(nameof(dataDirectory));
@@ -70,11 +73,29 @@ internal sealed class StandbyDatabase
             _incarnationRecordCleared = true;
         }
 
-        var result = _applier.ApplyPage((ulong)Math.Max(epoch, 0), batches);
+        // R5.2/R5.5: record the incarnation and base followed, if they changed, temp-and-rename. Written once the page is
+        // accepted and **before** its synced write (spec 011 R2.1). The follower has just shown, with HasDiverged, that
+        // what the database holds lies in the served log, so the record is true of it before the write and after; a
+        // crash after the write can no longer leave a record naming an older incarnation than the data, which a
+        // promotion would then claim as shared past its end. Recorded on any accepted page, even one with nothing new: a
+        // standby that is caught up keeps the incarnation it follows current, so the primary's history of earlier
+        // incarnations need not reach back to it.
+        if (batches.Count > 0)
+        {
+            _hook?.Invoke("standby.applying:" + _uid); // tests: hold one database's apply
+        }
+
+        var result = _applier.ApplyPage((ulong)Math.Max(epoch, 0), batches, accepted: () =>
+        {
+            RecordFollowed(servedIncarnation, servedBase, servedHistory);
+            _hook?.Invoke("standby.recorded");
+        });
         if (result.Status != ApplyStatus.Applied)
         {
             return result;
         }
+
+        _hook?.Invoke("standby.written");
 
         // R4.5: a page that wrote box 0 changed the catalogue; reload it before the next read through the database.
         if (result.TouchedCatalogue)
@@ -82,10 +103,11 @@ internal sealed class StandbyDatabase
             _slot.Context.LoadCatalogue(DatabaseKind.Database, _uid);
         }
 
-        // R5.2/R5.5: record the incarnation and base followed, if they changed, temp-and-rename. Written after the
-        // page's synced write, so a crash between the two causes at most a needless re-bootstrap, never a wrong apply.
-        // Recorded on any accepted page, even one with nothing new: a standby that is caught up keeps the incarnation it
-        // follows current, so the primary's history of earlier incarnations need not reach back to it.
+        return result;
+    }
+
+    private void RecordFollowed(string servedIncarnation, long servedBase, IReadOnlyList<IncarnationEnd>? servedHistory)
+    {
         if (Guid.TryParse(servedIncarnation, out var incarnation))
         {
             var current = KeptFollowRecord();
@@ -97,8 +119,6 @@ internal sealed class StandbyDatabase
                 _followRecord = FollowRecord.Read(_dataDirectory, _uid);
             }
         }
-
-        return result;
     }
 
     /// <summary>

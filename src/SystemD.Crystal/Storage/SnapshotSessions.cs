@@ -1,3 +1,4 @@
+// Ported from Highway: src/Highway.Server/Storage/Rocks/ReplicationFeeder.cs (snapshot sessions)
 // Spec 003 T10 / R7; design § 7 — the primary side of snapshot bootstrap: a session is a RocksDB checkpoint of one
 // database (hard-linked beside it) plus a manifest of its files with sizes and CRC-32C, served in chunks and expiring
 // after an idle or absolute limit. RocksDB-touching (checkpoints via WalAccess), so it lives in Storage.
@@ -46,8 +47,9 @@ internal sealed class SnapshotSessions : IDisposable
     private readonly ConcurrentDictionary<string, SnapshotSession> _sessions = new(StringComparer.Ordinal);
     private int _disposed;
 
-    public SnapshotSessions(string dataDirectory, TimeProvider clock)
+    public SnapshotSessions(string dataDirectory, TimeProvider clock, Action<string>? hook = null)
     {
+        _hook = hook;
         _dataDirectory = dataDirectory ?? throw new ArgumentNullException(nameof(dataDirectory));
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
 
@@ -111,6 +113,7 @@ internal sealed class SnapshotSessions : IDisposable
             wal.EnableFileDeletions();
         }
 
+        _hook?.Invoke("snapshot.manifest"); // tests: a slow checksum pass over a large database
         var manifest = BuildManifest(checkpointDir);
         var now = _clock.GetUtcNow().Ticks;
         var session = new SnapshotSession
@@ -228,6 +231,8 @@ internal sealed class SnapshotSessions : IDisposable
             }
         }
     }
+
+    private readonly Action<string>? _hook;
 
     private IReadOnlyList<SnapshotFile> BuildManifest(string checkpointDir)
     {

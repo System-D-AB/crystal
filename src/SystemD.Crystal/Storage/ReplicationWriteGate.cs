@@ -8,16 +8,37 @@ namespace SystemD.Crystal.Storage;
 
 /// <summary>
 /// Whether local writes to the store's replicated databases are refused, and why (003 addendum B2). A local write is
-/// admitted lock-free and counted until it ends; shutting the gate waits for the writes already admitted, so once a
-/// demotion or a fence returns no local write lands after it (003 review, race windows).
+/// admitted lock-free and counted until it ends. Shutting the gate is two steps: <see cref="Set"/> marks it shut (under
+/// the epoch's lock, so the gate always matches the role), and <see cref="WaitForAdmittedWrites"/> waits for the writes
+/// already admitted, called after that lock is released (spec 011 R5.1: an admitted write may be waiting on a lock a
+/// promotion holds while it waits for the epoch's lock). A demotion or a fence returns only after both, so no local
+/// write lands after it (003 review, race windows).
 /// </summary>
 internal sealed class ReplicationWriteGate
 {
+    private const string SteppingDown = "a primary handing over to a standby";
+
     private string? _refusedAs;
     private int _inFlight;
+    private int _steppingDown;
 
-    /// <summary>The node's role while writes are refused (<c>standby</c> or <c>fenced</c>), or null while it is primary.</summary>
-    public string? RefusedAs => Volatile.Read(ref _refusedAs);
+    /// <summary>
+    /// Why local writes are refused now: the node's role (<c>a standby</c>, <c>fenced</c>), or a primary handing over
+    /// (spec 011 R14.1); null while writes are accepted.
+    /// </summary>
+    public string? RefusedAs => Volatile.Read(ref _refusedAs) ?? (Volatile.Read(ref _steppingDown) == 1 ? SteppingDown : null);
+
+    /// <summary>The role's refusal alone (<c>a standby</c>, <c>fenced</c>), or null on a primary, handing over or not.</summary>
+    public string? RefusedByRole => Volatile.Read(ref _refusedAs);
+
+    /// <summary>
+    /// Refuses local writes while the node stays primary and keeps serving (spec 011 R14.1). False if a step-down is
+    /// already running. Writes admitted before it are waited for with <see cref="WaitForAdmittedWrites"/>.
+    /// </summary>
+    public bool BeginStepDown() => Interlocked.CompareExchange(ref _steppingDown, 1, 0) == 0;
+
+    /// <summary>Ends a step-down: writes are accepted again if the role allows them (spec 011 R14.3).</summary>
+    public void EndStepDown() => Interlocked.Exchange(ref _steppingDown, 0);
 
     /// <summary>Local writes admitted and not yet ended (tests).</summary>
     internal int InFlight => Volatile.Read(ref _inFlight);
@@ -37,7 +58,7 @@ internal sealed class ReplicationWriteGate
         // Count first, then read the role; Set writes the role, then reads the count. Both are full fences, so either
         // this write sees the gate shut, or Set sees it counted and waits for it.
         Interlocked.Increment(ref gate._inFlight);
-        refusedAs = Volatile.Read(ref gate._refusedAs);
+        refusedAs = gate.RefusedAs;
         if (refusedAs is not null)
         {
             Interlocked.Decrement(ref gate._inFlight);
@@ -48,23 +69,24 @@ internal sealed class ReplicationWriteGate
     }
 
     /// <summary>
-    /// Opens the gate (primary) or shuts it, naming the role (standby, fenced). Shutting it returns only when every
-    /// write admitted before has ended. It must not be called by a thread holding an admission.
+    /// Opens the gate (primary) or shuts it, naming the role (standby, fenced). Never waits: the caller holds the epoch's
+    /// lock. Writes admitted before it may still be running; <see cref="WaitForAdmittedWrites"/> waits for them.
     /// </summary>
-    public void Set(ReplicationRole role)
-    {
+    public void Set(ReplicationRole role) =>
         Interlocked.Exchange(ref _refusedAs, role switch
         {
             ReplicationRole.Primary => null,
-            ReplicationRole.Standby => "standby",
+            ReplicationRole.Standby => "a standby",
             _ => "fenced",
         });
 
-        if (role == ReplicationRole.Primary)
-        {
-            return;
-        }
-
+    /// <summary>
+    /// Returns when every write admitted before the gate was shut has ended. Blocks the calling thread (a spin, then
+    /// short sleeps). Must not be called while holding a lock an admitted write may need, nor by a thread holding an
+    /// admission.
+    /// </summary>
+    public void WaitForAdmittedWrites()
+    {
         var spin = default(SpinWait);
         while (Volatile.Read(ref _inFlight) != 0)
         {

@@ -31,6 +31,13 @@ public enum ReplicationRole
 /// (primary or promotable standby), follows a primary to become a standby, and promotes to accept writes. Epoch and
 /// role are node-local (<c>node.epoch</c>), never replicated.
 /// </summary>
+/// <remarks>
+/// <b>Blocking</b> (playbook § 7, spec 011 R11.10): <c>Promote</c>, <c>Demote</c>, <c>Fence</c>, <c>Follow</c>,
+/// <c>StopFollowing</c> and <c>Dispose</c> are synchronous and block the calling thread until the follower has stopped
+/// (at most one pull's long poll, <c>LongPollMax</c>), the node's epoch file is written, and the local writes already
+/// admitted have ended. They take this object's lock, so other members called meanwhile (<c>Status</c> among them)
+/// wait for them. Events are delivered on Crystal's own thread, never inside these calls.
+/// </remarks>
 public sealed class CrystalReplication : IDisposable
 {
     private readonly CrystalStore _store;
@@ -43,6 +50,22 @@ public sealed class CrystalReplication : IDisposable
     private readonly ILogger? _logger;
     private readonly Storage.ReplicationEpoch _epoch;
     private readonly Observability.ReplicationMetrics _metrics;
+    private ReplicationEventPump? _events;
+    private readonly Lock _eventsGate = new();
+
+    /// <summary>The event thread, started with the first event (review 2026-10-13, M6: a store that raises none has none).</summary>
+    private ReplicationEventPump? EventPump(bool create)
+    {
+        if (Volatile.Read(ref _events) is { } pump || !create)
+        {
+            return _events;
+        }
+
+        lock (_eventsGate)
+        {
+            return _events ??= Volatile.Read(ref _disposed) == 0 ? new ReplicationEventPump(e => Events?.Invoke(this, e), _logger) : null;
+        }
+    }
     private readonly Lock _gate = new();
     private readonly Queue<string> _transitions = new();
 
@@ -86,9 +109,21 @@ public sealed class CrystalReplication : IDisposable
             // the epoch's lock, and taking ours here could deadlock with a promotion holding ours and waiting for it.
             Volatile.Read(ref _source)?.SignalRoleOrEpochChange();
         };
+
+        // Standing down returns only once the local writes admitted before it have ended, waited for outside the epoch's
+        // lock (spec 011 R5.1): an admitted database change may be waiting for the store gate a promotion holds while the
+        // promotion waits for the epoch's lock.
+        _epoch.AfterRoleChanged = role =>
+        {
+            if (role != Storage.ReplicationRole.Primary)
+            {
+                _engine.WriteGate.WaitForAdmittedWrites();
+            }
+        };
         _metrics = new Observability.ReplicationMetrics(
             meterFactory, nodeId, () => _epoch.Epoch, () => _epoch.RoleName,
             () => Source?.Slots() ?? [],
+            () => Followed(),
             uid => _engine.LocalDatabasesForReconcile().FirstOrDefault(d => d.Uid == uid).Name,
             engine.TagMetricsWithDatabase);
     }
@@ -105,8 +140,17 @@ public sealed class CrystalReplication : IDisposable
     /// <summary>This node's current epoch (R6).</summary>
     public long Epoch => _epoch.Epoch;
 
-    /// <summary>Replication events (R9.3): promotions, demotions, fences, epoch changes, slots, gaps, divergences, conflicts.</summary>
+    /// <summary>
+    /// Replication events (R9.3): promotions, demotions, fences, epoch changes, slots, gaps, divergences, conflicts.
+    /// Handlers run on Crystal's own event thread, one at a time, in the order the events occurred (spec 011 R5.2), so a
+    /// handler may run after the call that caused its event has returned, and may itself call any member of this class.
+    /// A handler that throws is logged (event 2014) and does not stop later events. Disposing the store delivers the
+    /// events already queued, waiting at most 5 s.
+    /// </summary>
     public event EventHandler<ReplicationEvent>? Events;
+
+    /// <summary>Waits until every event raised so far has been delivered to the handlers (tests).</summary>
+    internal bool DrainEventsForTests(TimeSpan timeout) => EventPump(create: false)?.Drain(timeout) ?? true;
 
     /// <summary>
     /// Starts the replication listener on the configured endpoint so standbys can pull from this node (R10.1). The
@@ -124,7 +168,8 @@ public sealed class CrystalReplication : IDisposable
             }
 
             EnsureSource();
-            _listener = Replication.ReplicationListener.Start(_source!, _options!, _logger);
+            _listener = Replication.ReplicationListener.Start(
+                _source!, _options!, _logger, Replication.ReplicationProtocol.RequestCapFor(_engine.MaxOpenDatabases), () => _metrics.FrameRefused("primary"));
         }
     }
 
@@ -148,6 +193,7 @@ public sealed class CrystalReplication : IDisposable
     public void Follow(string primaryEndpoint)
     {
         ArgumentException.ThrowIfNullOrEmpty(primaryEndpoint);
+        _ = ReplicationFollower.ParseEndpoint(primaryEndpoint); // a bad endpoint is refused now (spec 011 R11.5), not looped on
         RequireOptions();
         lock (_gate)
         {
@@ -155,7 +201,7 @@ public sealed class CrystalReplication : IDisposable
             _epoch.SetRole(Storage.ReplicationRole.Standby);
             _follower?.DisposeAsync().AsTask().GetAwaiter().GetResult();
             _followedPrimary = primaryEndpoint;
-            _follower = new ReplicationFollower(_store, _engine, _nodeId, _epoch, _options!, primaryEndpoint, _dataDirectory, _logger, Raise);
+            _follower = new ReplicationFollower(_store, _engine, _nodeId, _epoch, _options!, primaryEndpoint, _dataDirectory, _logger, Raise, _metrics);
         }
     }
 
@@ -201,7 +247,7 @@ public sealed class CrystalReplication : IDisposable
             // same step under the store gate, so no database opens in between without a history.
             var newEpoch = 0L;
             System.IO.IOException? failure = null;
-            if (!_engine.BeginNewIncarnations(() => _epoch.TryPromote(Storage.ReplicationRole.Primary, out newEpoch, out failure)))
+            if (!_engine.BeginNewIncarnations(() => _epoch.TryPromote(Storage.ReplicationRole.Primary, out newEpoch, out failure), out var pendingResync))
             {
                 // A typed error a failover controller must handle (playbook § 7): the disk, not the caller, is at fault.
                 throw new System.IO.IOException(
@@ -212,6 +258,15 @@ public sealed class CrystalReplication : IDisposable
             }
 
             Raise(new ReplicationEvent(ReplicationEventKind.Promoted, newEpoch, $"promoted: {reason}"));
+            if (pendingResync.Count > 0)
+            {
+                Raise(new ReplicationEvent(
+                    ReplicationEventKind.PromotedWithPendingResync,
+                    newEpoch,
+                    "promoted with databases marked for re-bootstrap: " +
+                    string.Join(", ", pendingResync.Select(p => $"'{p.Name}' ({p.Reason})"))));
+            }
+
             return newEpoch;
         }
     }
@@ -235,12 +290,148 @@ public sealed class CrystalReplication : IDisposable
             // below holds every write this node committed (003 review, race windows). Then, R9.2: record what this
             // node committed beyond any standby's acknowledgement.
             _epoch.SetRole(Storage.ReplicationRole.Standby);
+            // Every replicated database is reported (spec 011 R8.1), so a primary that never listened reports too.
+            if (_options is not null)
+            {
+                EnsureSource();
+            }
+
             var report = _source?.WriteReconciliationReport();
             _source?.ClearAllHistory();
             LastReconciliationReport = report;
             Raise(new ReplicationEvent(ReplicationEventKind.Demoted, _epoch.Epoch,
                 report is null ? "demoted by request" : $"demoted by request; reconciliation report at {report}"));
         }
+    }
+
+    /// <summary>
+    /// Hands the primary role over without losing a write (spec 011 R14): refuses local writes to replicated databases at
+    /// once, keeps serving, waits until the standby <paramref name="standbyNodeId"/> has acknowledged the latest position
+    /// of every replicated database, then demotes this node (an empty reconciliation report) and returns each database's
+    /// final position. The product then promotes that standby and points this node at it with <see cref="Follow"/>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Yields a thread</b> while it waits (it polls the standby's acknowledgements on the store's clock every 20 ms).
+    /// If the standby has not caught up within <paramref name="timeout"/>, or <paramref name="cancellationToken"/> fires,
+    /// writes are accepted again and the node stays the primary. A role change meanwhile (a fence, a higher epoch) ends it.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">This node is not the primary, a step-down is already running, or the
+    /// role or epoch changed while it waited.</exception>
+    /// <exception cref="TimeoutException">The standby did not catch up in time; the node is still the primary.</exception>
+    public async Task<IReadOnlyList<SteppedDownDatabase>> StepDownAsync(string standbyNodeId, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(standbyNodeId);
+        RequireOptions();
+        long epoch;
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_epoch.Role != Storage.ReplicationRole.Primary)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot step down: this node is {_epoch.RoleName}, not the primary. Only a primary hands over (spec 011 R14.5).");
+            }
+
+            if (!_engine.WriteGate.BeginStepDown())
+            {
+                throw new InvalidOperationException("Cannot step down: a step-down is already running on this node (spec 011 R14.5).");
+            }
+
+            epoch = _epoch.Epoch;
+            EnsureSource();
+        }
+
+        try
+        {
+            // Writes admitted before the step-down end first; from then on nothing local is written (R14.1).
+            await Task.Run(_engine.WriteGate.WaitForAdmittedWrites, cancellationToken).ConfigureAwait(false);
+            var positions = _engine.ReplicatedDatabaseSet()
+                .Select(d => new SteppedDownDatabase(d.Uid, d.Name, LatestOf(d.Uid)))
+                .ToList();
+
+            // Wait for the standby to acknowledge every one (R14.2, R14.6), on the store's clock.
+            using var deadline = new CancellationTokenSource(timeout, _engine.Clock);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken);
+            while (true)
+            {
+                if (_epoch.Role != Storage.ReplicationRole.Primary || _epoch.Epoch != epoch)
+                {
+                    throw new InvalidOperationException(
+                        $"The step-down ended: this node became {_epoch.RoleName} at epoch {_epoch.Epoch} while it waited (spec 011 R14.4).");
+                }
+
+                var behind = Behind(standbyNodeId, positions);
+                if (behind.Count == 0)
+                {
+                    break;
+                }
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(20), _engine.Clock, linked.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException(
+                        $"The standby {standbyNodeId} did not catch up within {timeout}: still behind on {string.Join(", ", behind)}. " +
+                        "Writes are accepted again and this node is still the primary (spec 011 R14.3).");
+                }
+            }
+
+            // Caught up: stand down as Demote does. The report is empty, as every write was acknowledged.
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                if (_epoch.Role != Storage.ReplicationRole.Primary || _epoch.Epoch != epoch)
+                {
+                    throw new InvalidOperationException(
+                        $"The step-down ended: this node became {_epoch.RoleName} at epoch {_epoch.Epoch} while it waited (spec 011 R14.4).");
+                }
+
+                _epoch.SetRole(Storage.ReplicationRole.Standby);
+                var report = _source?.WriteReconciliationReport();
+                _source?.ClearAllHistory();
+                LastReconciliationReport = report;
+                Raise(new ReplicationEvent(ReplicationEventKind.Demoted, _epoch.Epoch,
+                    report is null ? $"stepped down to {standbyNodeId}" : $"stepped down to {standbyNodeId}; reconciliation report at {report}")
+                {
+                    PeerNodeId = standbyNodeId,
+                });
+            }
+
+            return positions;
+        }
+        finally
+        {
+            // Writes resume unless the node stood down, whose role now refuses them on its own (R14.3).
+            _engine.WriteGate.EndStepDown();
+        }
+    }
+
+    /// <summary>The databases on which <paramref name="standbyNodeId"/> has not acknowledged the position given, by name.</summary>
+    private List<string> Behind(string standbyNodeId, IReadOnlyList<SteppedDownDatabase> positions)
+    {
+        var slots = Volatile.Read(ref _source)?.Slots() ?? [];
+        var behind = new List<string>();
+        foreach (var db in positions)
+        {
+            // Exactly the position (spec 011 R14.2): a slot above it states batches this primary never had, so it is a
+            // standby that diverged, not one that caught up.
+            var acked = slots.FirstOrDefault(s => s.Standby == standbyNodeId && s.DatabaseUid == db.Uid);
+            if (acked is null || acked.Acknowledged != db.Position)
+            {
+                behind.Add(db.Name);
+            }
+        }
+
+        return behind;
+    }
+
+    private long LatestOf(string uid)
+    {
+        var slot = _engine.OpenReplicatedByUid(_store, uid);
+        using var scope = slot?.TryEnter();
+        return scope is null ? 0 : (long)slot!.LatestSequence;
     }
 
     /// <summary>The path of the reconciliation report the last demote wrote (spec 003 R9.2), or null if none/nothing unreplicated.</summary>
@@ -279,11 +470,51 @@ public sealed class CrystalReplication : IDisposable
     public void ScheduleRejoin(string primaryEndpoint)
     {
         ArgumentException.ThrowIfNullOrEmpty(primaryEndpoint);
+        _ = ReplicationFollower.ParseEndpoint(primaryEndpoint); // refused now, not at the next start (spec 011 R11.5)
         lock (_gate)
         {
             ThrowIfDisposed();
             Storage.RejoinMarker.Write(_dataDirectory, primaryEndpoint);
         }
+    }
+
+    /// <summary>
+    /// At open, a scheduled rejoin follows the endpoint it names (spec 011 R11.4, 003 R7.8): the node becomes a standby
+    /// and every replicated database re-bootstraps from that primary, without the product calling <see cref="Follow"/>.
+    /// Without replication options, or with a marker naming no valid endpoint, nothing starts (the marker stays).
+    /// </summary>
+    internal void ResumeScheduledRejoin()
+    {
+        if (_options is null || Storage.RejoinMarker.Read(_dataDirectory) is not { } endpoint)
+        {
+            return;
+        }
+
+        try
+        {
+            _ = ReplicationFollower.ParseEndpoint(endpoint);
+        }
+        catch (ArgumentException)
+        {
+            _logger?.LogError("[replication] the scheduled rejoin names no valid endpoint ('{Endpoint}'); not following", endpoint);
+            return;
+        }
+
+        Follow(endpoint);
+    }
+
+    /// <summary>The databases followed now, named (spec 011 R10.4); read lock-free from the follower's last publication.</summary>
+    private IReadOnlyList<FollowedDatabase> Followed()
+    {
+        var positions = Volatile.Read(ref _follower)?.Positions ?? [];
+        if (positions.Count == 0)
+        {
+            return [];
+        }
+
+        var names = _engine.LocalDatabasesForReconcile().ToDictionary(d => d.Uid, d => d.Name, StringComparer.Ordinal);
+        return [.. positions.Select(p => new FollowedDatabase(
+            p.Uid, names.TryGetValue(p.Uid, out var name) ? name : p.Uid, p.Position, p.PrimaryLatest, Math.Max(0, p.PrimaryLatest - p.Position)))];
     }
 
     private void EnsureSource()
@@ -293,6 +524,8 @@ public sealed class CrystalReplication : IDisposable
             _source = new Storage.ReplicationSource(_store, _engine, _nodeId, _epoch, _options!)
             {
                 OnEvent = Raise,
+                OnReport = path => LastReconciliationReport = path,
+                OnShipped = bytes => _metrics.BytesShipped(bytes),
             };
         }
     }
@@ -310,7 +543,9 @@ public sealed class CrystalReplication : IDisposable
             }
         }
 
-        Events?.Invoke(this, e);
+        // Delivered on the event thread (spec 011 R5.2): the raising thread may hold the facade's lock or be the
+        // follower that a handler's Promote would wait for.
+        EventPump(create: true)?.Post(e);
     }
 
     private void Log(ReplicationEvent e)
@@ -332,6 +567,7 @@ public sealed class CrystalReplication : IDisposable
             case ReplicationEventKind.Divergence: Observability.CrystalLog.ReplicationDivergence(_logger, e.Epoch, e.Detail); break;
             case ReplicationEventKind.FormatRefused: Observability.CrystalLog.ReplicationFormatRefused(_logger, e.Epoch, e.Detail); break;
             case ReplicationEventKind.Conflict: Observability.CrystalLog.ReplicationConflict(_logger, e.Epoch, e.Detail); break;
+            case ReplicationEventKind.PromotedWithPendingResync: Observability.CrystalLog.ReplicationPromotedWithPendingResync(_logger, e.Epoch, e.Detail); break;
         }
     }
 
@@ -362,6 +598,7 @@ public sealed class CrystalReplication : IDisposable
         }
 
         // Read outside the lock: aging slots may raise events, which must not wait on it.
+        status = status with { Followed = Followed() };
         return source is null ? status : status with { Slots = source.Slots() };
     }
 
@@ -402,6 +639,10 @@ public sealed class CrystalReplication : IDisposable
 
         _listener?.Dispose();
         _source?.Dispose();
+        lock (_eventsGate)
+        {
+            _events?.Dispose();
+        }
         _metrics.Dispose();
     }
 }
@@ -422,7 +663,28 @@ public sealed record ReplicationStatus(
     string? FollowedPrimary,
     string? ListenerEndpoint,
     IReadOnlyList<string> RecentTransitions,
-    IReadOnlyList<ReplicationSlot> Slots);
+    IReadOnlyList<ReplicationSlot> Slots)
+{
+    /// <summary>The databases this node follows as a standby, with position and lag (spec 011 R10.4); empty on a primary.</summary>
+    public IReadOnlyList<FollowedDatabase> Followed { get; init; } = [];
+}
+
+/// <summary>A database handed over by <see cref="CrystalReplication.StepDownAsync"/> (spec 011 R14.2): its final position.</summary>
+/// <param name="Uid">The database's UID.</param>
+/// <param name="Name">Its name.</param>
+/// <param name="Position">Its latest position when writes stopped, which the standby acknowledged.</param>
+public sealed record SteppedDownDatabase(string Uid, string Name, long Position);
+
+/// <summary>
+/// A database this standby follows (spec 011 R10.4, 003 R13.2): its position, the primary's latest position as the last
+/// reply stated it, and the difference.
+/// </summary>
+/// <param name="Uid">The database's UID.</param>
+/// <param name="Name">Its name on this node.</param>
+/// <param name="Position">The position applied here.</param>
+/// <param name="PrimaryLatest">The primary's latest position, from the last reply that named it.</param>
+/// <param name="Lag">Sequences this standby lacks: <c>PrimaryLatest - Position</c>, never below zero.</param>
+public sealed record FollowedDatabase(string Uid, string Name, long Position, long PrimaryLatest, long Lag);
 
 /// <summary>A standby slot's state (spec 003 R2.3).</summary>
 public enum ReplicationSlotState

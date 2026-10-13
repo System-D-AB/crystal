@@ -35,6 +35,7 @@ public sealed class EpochAndRoleTests
 
         Assert.Equal(before + 1, newEpoch);
         Assert.Equal(ReplicationRole.Primary, store.Replication.Role);
+        EventDelivery.Drain(store);
         Assert.Contains(events, e => e.Kind == ReplicationEventKind.Promoted && e.Epoch == newEpoch);
     }
 
@@ -59,6 +60,7 @@ public sealed class EpochAndRoleTests
 
         Assert.Equal(epoch, store.Replication.Epoch);
         Assert.Equal(ReplicationRole.Standby, store.Replication.Role);
+        EventDelivery.Drain(store);
         Assert.DoesNotContain(events, e => e.Kind == ReplicationEventKind.Promoted);
 
         // With the disk fixed, promotion succeeds.
@@ -96,6 +98,7 @@ public sealed class EpochAndRoleTests
 
         store.Replication.Fence("test");
         Assert.Equal(ReplicationRole.Fenced, store.Replication.Role);
+        EventDelivery.Drain(store);
         Assert.Contains(events, e => e.Kind == ReplicationEventKind.Fenced);
     }
 
@@ -111,86 +114,67 @@ public sealed class EpochAndRoleTests
 
         store.Replication.Demote();
         Assert.Equal(ReplicationRole.Standby, store.Replication.Role);
+        EventDelivery.Drain(store);
         Assert.Contains(events, e => e.Kind == ReplicationEventKind.Demoted);
     }
 
     [Fact]
     public async Task AStalePrimary_IsDemotedByAHigherEpoch_OnHello()
     {
-        // A primary at epoch E hears a HELLO from a peer at epoch E+1: it adopts the epoch and demotes (R6.3, R14.8).
+        // A primary at epoch E hears an authenticated peer at a higher epoch: it adopts the epoch and demotes (R6.3,
+        // R14.8). Rewritten for spec 011 R12.1: it used to drive a separate ReplicationSource over a second
+        // ReplicationEpoch loaded from the file, so the store's own role and epoch were never shown to change. It now
+        // goes through the store's listener, and asserts on the store.
         using var dir = new TempStoreDirectory();
-        using var store = CrystalStore.Open(dir.Path, Options());
-        store.Replication.Promote("become primary"); // epoch 2, Primary
-
+        using var store = CrystalStore.Open(dir.Path, Options(listen: "127.0.0.1:0"));
+        store.Replication.Promote("become primary");
+        store.Replication.Listen();
         var events = new List<ReplicationEvent>();
-        var epoch = ReplicationEpoch.Load(dir.Path, SystemD.Crystal.Storage.ReplicationRole.Primary);
-        // Use the live store's facade epoch by driving a source directly over a duplex connection.
-        var source = new ReplicationSource(store, store.Engine, store.NodeId, LiveEpoch(store), Options().Replication!)
+        store.Replication.Events += (_, e) => { lock (events) { events.Add(e); } };
+        var higher = store.Replication.Epoch + 5;
+
+        await HandshakeWith(store, "peer-node", ReplicationProtocol.RolePrimary, higher);
+
+        Assert.True(SpinWait.SpinUntil(() => store.Replication.Role == ReplicationRole.Standby, TimeSpan.FromSeconds(10)));
+        Assert.Equal(higher, store.Replication.Epoch);
+        EventDelivery.Drain(store);
+        lock (events)
         {
-            OnEvent = e => events.Add(e),
-        };
-        _ = epoch;
-
-        var (server, client) = DuplexPair();
-        var connection = new ReplicationConnection(server, source, "peer", null);
-        var serve = connection.ServeAsync(CancellationToken.None);
-
-        var replica = new ReplicationClient(client, "peer-node", "test-secret");
-        // The peer announces a HIGHER epoch in its HELLO.
-        await replica.HandshakeAsync(ReplicationProtocol.RolePrimary, store.Replication.Epoch + 5, CancellationToken.None);
-
-        Assert.Contains(events, e => e.Kind == ReplicationEventKind.Demoted);
-        Assert.Contains(events, e => e.Kind == ReplicationEventKind.EpochChanged);
-
-        source.Dispose();
-        ((IDisposable)server).Dispose();
-        ((IDisposable)client).Dispose();
-        try { await serve; } catch { /* closed */ }
+            Assert.Contains(events, e => e.Kind == ReplicationEventKind.Demoted);
+            Assert.Contains(events, e => e.Kind == ReplicationEventKind.EpochChanged && e.Epoch == higher);
+        }
     }
 
     [Fact]
     public async Task TwoPrimariesAtTheSameEpoch_RaiseAConflictEvent()
     {
+        // The primary-side check (R6.4): a peer stating it is a primary at this node's epoch. Through the store's own
+        // listener and epoch (spec 011 R12.1); the standby-side check between real nodes is ConflictTests.
         using var dir = new TempStoreDirectory();
-        using var store = CrystalStore.Open(dir.Path, Options());
-        store.Replication.Promote("become primary"); // Primary at some epoch
-
+        using var store = CrystalStore.Open(dir.Path, Options(listen: "127.0.0.1:0"));
+        store.Replication.Promote("become primary");
+        store.Replication.Listen();
         var events = new List<ReplicationEvent>();
-        var source = new ReplicationSource(store, store.Engine, store.NodeId, LiveEpoch(store), Options().Replication!)
+        store.Replication.Events += (_, e) => { lock (events) { events.Add(e); } };
+
+        await HandshakeWith(store, "the-other-primary", ReplicationProtocol.RolePrimary, store.Replication.Epoch);
+
+        EventDelivery.Drain(store);
+        lock (events)
         {
-            OnEvent = e => events.Add(e),
-        };
+            var conflict = Assert.Single(events, e => e.Kind == ReplicationEventKind.Conflict);
+            Assert.Equal("the-other-primary", conflict.PeerNodeId);
+        }
 
-        var (server, client) = DuplexPair();
-        var connection = new ReplicationConnection(server, source, "peer", null);
-        var serve = connection.ServeAsync(CancellationToken.None);
-
-        var replica = new ReplicationClient(client, "the-other-primary", "test-secret");
-        // Another primary announces the SAME epoch.
-        await replica.HandshakeAsync(ReplicationProtocol.RolePrimary, source.Epoch, CancellationToken.None);
-
-        Assert.Contains(events, e => e.Kind == ReplicationEventKind.Conflict);
-
-        source.Dispose();
-        ((IDisposable)server).Dispose();
-        ((IDisposable)client).Dispose();
-        try { await serve; } catch { /* closed */ }
+        Assert.Equal(ReplicationRole.Primary, store.Replication.Role); // Crystal reports; the product decides
     }
 
-    // The live store's epoch holder, so the source and the facade share one epoch/role (reflection-free: Load reads
-    // the same node.epoch the facade persisted, and the facade has already promoted, so the file is current).
-    private static ReplicationEpoch LiveEpoch(CrystalStore store)
+    private static async Task HandshakeWith(CrystalStore store, string nodeId, string role, long epoch)
     {
-        var holder = ReplicationEpoch.Load(store.DataDirectory, SystemD.Crystal.Storage.ReplicationRole.Primary);
-        return holder;
-    }
-
-    private static (System.IO.Stream Server, System.IO.Stream Client) DuplexPair()
-    {
-        var toServer = new System.IO.Pipelines.Pipe();
-        var toClient = new System.IO.Pipelines.Pipe();
-        var server = new DuplexStream(toServer.Reader, toClient.Writer);
-        var client = new DuplexStream(toClient.Reader, toServer.Writer);
-        return (server, client);
+        var endpoint = store.Replication.ListenerEndpoint!;
+        using var tcp = new System.Net.Sockets.TcpClient();
+        await tcp.ConnectAsync("127.0.0.1", int.Parse(endpoint[(endpoint.LastIndexOf(':') + 1)..], System.Globalization.CultureInfo.InvariantCulture));
+        var client = new ReplicationClient(tcp.GetStream(), nodeId, "test-secret");
+        await client.HandshakeAsync(role, epoch, CancellationToken.None);
     }
 }

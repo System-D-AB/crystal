@@ -18,15 +18,17 @@ internal sealed class TestNode : IDisposable
 
     private readonly TempDirectory? _ownedDirectory;
     private readonly DurabilityMode _durability;
+    private readonly NodeTls? _tls;
     private HostProcess? _process;
     private long _nextId;
 
-    private TestNode(string dataDirectory, TempDirectory? ownedDirectory, int port, DurabilityMode durability)
+    private TestNode(string dataDirectory, TempDirectory? ownedDirectory, int port, DurabilityMode durability, NodeTls? tls)
     {
         DataDirectory = dataDirectory;
         _ownedDirectory = ownedDirectory;
         Port = port;
         _durability = durability;
+        _tls = tls;
     }
 
     /// <summary>The node's data directory; deleted on dispose if this node created it.</summary>
@@ -47,10 +49,10 @@ internal sealed class TestNode : IDisposable
     public int ExitCode => _process is { HasExited: true } p ? p.ExitCode : throw new InvalidOperationException("The node is running.");
 
     /// <summary>Starts a node in a new temporary directory (or <paramref name="dataDirectory"/>), on a free port.</summary>
-    public static TestNode Start(string? dataDirectory = null, DurabilityMode durability = DurabilityMode.Strict)
+    public static TestNode Start(string? dataDirectory = null, DurabilityMode durability = DurabilityMode.Strict, NodeTls? tls = null)
     {
         var owned = dataDirectory is null ? new TempDirectory("crystal-node") : null;
-        var node = new TestNode(dataDirectory ?? owned!.Path, owned, FreePort.Next(), durability);
+        var node = new TestNode(dataDirectory ?? owned!.Path, owned, FreePort.Next(), durability, tls);
         try
         {
             node.Launch();
@@ -102,6 +104,13 @@ internal sealed class TestNode : IDisposable
 
     public void Put(string db, string box, string key, string value, DurabilityMode? durability = null) =>
         Send("put", ("db", db), ("box", box), ("key", key), ("value", value), ("durability", durability?.ToString()));
+
+    /// <summary>Hands the primary role over to <paramref name="standby"/> (spec 011 R14); returns the databases handed over.</summary>
+    public int StepDown(TestNode standby) => Send("stepdown", ("standby", standby.NodeId))!.GetValue<int>();
+
+    /// <summary>Commits <paramref name="count"/> keys <c>{prefix}-0</c> … in one batch (spec 011 R12.2).</summary>
+    public void PutBatch(string db, string box, string prefix, int count) =>
+        Send("putbatch", ("db", db), ("box", box), ("prefix", prefix), ("count", count.ToString(System.Globalization.CultureInfo.InvariantCulture)));
 
     public string? Get(string db, string box, string key) => Send("get", ("db", db), ("box", box), ("key", key))?.GetValue<string>();
 
@@ -171,10 +180,12 @@ internal sealed class TestNode : IDisposable
 
     private void Launch()
     {
+        string[] tls = _tls is null
+            ? []
+            : ["--cert", _tls.CertificatePath, "--trust", _tls.TrustPath, .. _tls.RequireClientCertificate ? new[] { "--require-client-cert" } : []];
         _process = HostProcess.Start(
             "SystemD.Crystal.NodeHost.dll",
-            "--dir", DataDirectory, "--port", Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            "--durability", _durability.ToString());
+            ["--dir", DataDirectory, "--port", Port.ToString(System.Globalization.CultureInfo.InvariantCulture), "--durability", _durability.ToString(), .. tls]);
         var ready = _process.ReadLine(StartTimeout);
         if (!ready.StartsWith("READY ", StringComparison.Ordinal))
         {
@@ -191,6 +202,9 @@ internal sealed class TestNode : IDisposable
         _ownedDirectory?.Dispose();
     }
 }
+
+/// <summary>Replication over TLS for a test node (spec 011 T16): its certificate (PFX), the CA it trusts, mutual or not.</summary>
+internal sealed record NodeTls(string CertificatePath, string TrustPath, bool RequireClientCertificate);
 
 /// <summary>A command the node refused, with the exception it reported.</summary>
 internal sealed class NodeCommandException(string command, string error, string message)

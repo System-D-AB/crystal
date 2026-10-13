@@ -619,3 +619,11 @@ reviews of the fixes found more, also fixed. Tests: `tests/SystemD.Crystal.Tests
     `Apply` writes it. Test (`DivergenceAndGapTests` 1; the design-table test starts a new follow after deleting the
     record).
   - Five mutations, each caught.
+- **Third independent review (2026-10-12): not yet implemented.** A read-only review of the whole replication
+  surface found one blocker (mutual AUTH can be reflected: the server's proof and the client's answer are the same
+  function, and neither side refuses its own node id), eight should-fix defects (a stale follow record trusted at
+  promotion, a bootstrap stalling the pull loop, size caps that stop replication silently, two deadlocks, a native use
+  after close on a role change, a conflict check that never fires between real nodes, an incomplete reconciliation
+  report, no directory sync after renames and an install that moves its folder before advancing the allocator), and
+  minor gaps against R3.4, R3.7, R6.4, R7.1, R7.8, R13 and R15. Each was checked against the code. They are specified
+  in `011-replication-completion`; `003` is marked implemented together with `011`.

@@ -600,7 +600,7 @@ internal sealed class DatabaseContext : IDisposable
         if (refusedAs is { } role)
         {
             throw new NotPrimaryException(
-                $"{_label} is replicated and this node is a {role}, not the primary; it refuses local writes (R1.6, " +
+                $"{_label} is replicated and this node is {role}, so it refuses local writes (R1.6, " +
                 "R6.5). Write on the primary, or promote this node to accept writes here.");
         }
 

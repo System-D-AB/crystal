@@ -31,7 +31,7 @@ internal interface IReplicationSource
     /// and node id. A higher epoch is adopted (a primary demotes); an equal epoch from another primary is a conflict
     /// event. Returns nothing — the node's own role/epoch may change as a result, which the next reply reflects.
     /// </summary>
-    void ObservePeer(long peerEpoch, string peerRole, string peerNodeId);
+    void ObservePeer(long peerEpoch, string peerRole, string peerNodeId, string? peerEndpoint = null);
 
     /// <summary>
     /// Handles an authenticated command other than <c>HELLO</c>, <c>AUTH</c> and <c>STATUS</c> (which the connection
