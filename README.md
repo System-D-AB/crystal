@@ -20,8 +20,18 @@ Crystal is a kernel, not a database server. It has no query language, documents,
 failover policy: the product built on top decides those. See [`product/intro.md`](product/intro.md) for what Crystal is
 and is not, and [`engineering/box-layout.md`](engineering/box-layout.md) for how the bytes are laid out.
 
-> **Status: pre-release (`0.1.0-preview.1`), not yet published to NuGet.** Build the package from source (below).
-> The public API may still change before 1.0.
+> **Status: `1.0.0-preview.1`, a prerelease.** The storage kernel is complete; the public API may still change before
+> 1.0, as the first products adopt it. Tested on Windows; the first Linux run of the suite is pending. Changes per
+> version: [`CHANGELOG.md`](CHANGELOG.md).
+
+## Install
+
+```sh
+dotnet add package SystemD.Crystal --version 1.0.0-preview.1
+```
+
+Requires .NET 10. The package brings RocksDB's native libraries with it (the `RocksDB` package, pinned to one exact
+version).
 
 ## Using it
 

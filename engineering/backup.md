@@ -75,7 +75,7 @@ time.
   "node": "…",
   "started": "2026-10-13T12:00:00.0000000Z",
   "completed": "2026-10-13T12:03:41.5120000Z",
-  "versions": { "store": "crystal 1", "catalogue": 1, "encoder": 1, "crystal": "0.1.0-preview.1", "rocksdb": "11.8.1" },
+  "versions": { "store": "crystal 1", "catalogue": 1, "encoder": 1, "crystal": "1.0.0-preview.1", "rocksdb": "11.8.1" },
   "databases": [
     { "name": "shop", "uid": "…", "replicated": true, "created": "…",
       "backup": 7, "sequence": 918273, "bytes": 104857600, "files": 41 }
