@@ -134,6 +134,16 @@ be trimmed. Each entry carries the database's incarnation, base and latest even 
 always knows its lag and can check divergence. A caught-up pull long-polls up to `waitMs` on a commit, set-version or
 epoch change, so an idle standby does not spin and a commit wakes a waiting pull at once.
 
+**Shipping in batches (spec 014).** A commit's replication work is to add its batch to the tail and signal: an
+interlocked increment, and one completion when a pull is waiting (`ChangeSignal`). The waits are asynchronous and hold
+no thread: the long poll, and the **gather window** (`ReplicationOptions.GatherWindow`, 10 ms): a standby whose
+previous reply was neither a full page nor read from the WAL is answered no sooner than one window after it, so the
+commits of the window ship in one reply. A standby catching up is answered at once, and a change of role, epoch or
+database set ends the wait (it is signalled apart from commits). The window exists because each page costs the standby
+a synced write: shipped one per commit, a standby on the same disk doubled the primary's fsyncs and added about 0.8 ms
+to every Strict commit (spec 014 design addendum). The wait is a timer, so it lasts at least the operating system's
+timer resolution (15.6 ms on Windows by default); `TimeSpan.Zero` turns it off, and it must be at most 1 s.
+
 The standby loop (`ReplicationFollower`): connect and handshake; read `DATABASES` and reconcile the set on a new
 connection and whenever a `PULL` reply states a set version other than the one last reconciled (never before every
 pull, so a catch-up costs one round trip per page); `PULL` every followed database; adopt a newer reply epoch (refuse an older one); for each entry check
@@ -350,7 +360,11 @@ conflicts, gaps, divergences, slot drops, format refusals, bootstraps, pages and
 epoch and role, slots by state (`crystal.slot.state`), and the worst lag of the slots not dropped in sequences
 (`crystal.replication.lag`) and seconds (`crystal.replication.lag_time`), per database when `TagMetricsWithDatabase`
 is on, plus `bytes_shipped` (primary), `pages_applied`, `bytes_applied`, `bootstraps` and the gauge `standby_lag`
-(standby), and `frames_refused`. `Status().Followed` lists each database a standby follows with its position, the
+(standby), and `frames_refused`. The primary also counts the database pages it served with batches by source,
+`crystal.replication.pull.source` (`crystal.pull.source` = `tail` or `wal`, and `crystal.pull.miss` = `none` for a
+tail page, `behind` or `landing` for a WAL page), and records `crystal.replication.ship_delay`, the time from commit to shipping of the oldest
+batch of each page served from the tail (spec 014). A lag in time is exact while the tail holds the first batch the
+standby lacks (the tail keeps each batch's commit time) and from the commit timeline's 100 ms samples beyond it. `Status().Followed` lists each database a standby follows with its position, the
 primary's latest from the last reply, and the lag. Log events in `CrystalLogEvents`' 2000s range, one per event of
 R9.3 plus connected/lost (2011/2012, on the follower and on the listener's authenticated connections). A standby that
 adopts a newer epoch from its primary (handshake, page or snapshot) raises `EpochChanged`. **Events are

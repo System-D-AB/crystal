@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.0-rc.2
+
+The second 1.0 release candidate. No format, catalogue, encoder or protocol change: stores written by 1.0.0-rc.1
+open unchanged, and a standby on 1.0.0-rc.1 follows a primary on this build, and the reverse.
+
+- **Replication ships in batches** (spec `014`). A Strict commit on a primary with a standby attached no longer costs
+  a page, and a synced write on the standby, per commit: a standby near the head is answered at most once per
+  **gather window** (`ReplicationOptions.GatherWindow`, 10 ms; `TimeSpan.Zero` restores per-commit shipping), and a
+  standby catching up is answered at once. Under Highway's load harness, Strict commit p50 fell from 3.5 ms to 2.2 ms,
+  the same as with no standby attached. The price is lag: a standby near the head now trails by up to about one
+  window (on Windows the window rounds up to the 15.6 ms timer; lag sampled once a second had a median of 14–15 ms
+  and a p99 of up to 46 ms under that harness).
+- **A waiting pull holds no thread:** the primary's long poll and the gather window are asynchronous waits.
+- **Less replication work per commit:** the commit timeline takes its lock only when a sample is due (about ten times
+  a second), not on every commit. The tail still takes its own short lock to record each batch.
+- **Exact lag in time:** `crystal.replication.lag_time` and a slot's `LagTime` come from each batch's commit time
+  while the primary's tail holds it, no longer only from 100 ms samples.
+- **Observability:** `crystal.replication.pull.source` (pages served from the tail or the WAL) and
+  `crystal.replication.ship_delay` (commit to shipping of each page's oldest batch).
+
 ## 1.0.0-rc.1
 
 The first 1.0 release candidate. Every addition is to the API; nothing was removed or renamed. No format,

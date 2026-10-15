@@ -4,6 +4,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.Threading;
 
 namespace SystemD.Crystal.Replication;
 
@@ -26,6 +27,13 @@ internal sealed class CommitTimeline
     private int _start;
     private int _count;
 
+    // Spec 014 R1.1 — the commit path takes the lock only when a sample is due (about ten times a second). Between
+    // samples a commit raises _pending, the newest sequence committed since the newest sample, without a lock, and the
+    // next sample or read folds it into the newest sample: the same samples as before, no lock per commit.
+    private const long NoSample = long.MinValue;
+    private long _newestTicks = NoSample;
+    private long _pending;
+
     /// <summary>
     /// Records a committed batch (its WAL bytes: an 8-byte sequence and a 4-byte count lead every batch) at
     /// <paramref name="nowTicks"/>. Within <see cref="SampleInterval"/> of the last sample, only that sample's sequence
@@ -41,6 +49,13 @@ internal sealed class CommitTimeline
         var first = (long)BinaryPrimitives.ReadUInt64LittleEndian(batch);
         var count = BinaryPrimitives.ReadUInt32LittleEndian(batch[8..]);
         var last = first + Math.Max(count, 1u) - 1;
+        var newestTicks = Volatile.Read(ref _newestTicks);
+        if (newestTicks != NoSample && nowTicks - newestTicks < SampleInterval.Ticks)
+        {
+            RaisePending(last);
+            return;
+        }
+
         lock (_sync)
         {
             if (_count > 0)
@@ -48,9 +63,12 @@ internal sealed class CommitTimeline
                 var newest = (_start + _count - 1) % Capacity;
                 if (nowTicks - _ticks[newest] < SampleInterval.Ticks)
                 {
-                    _sequences[newest] = Math.Max(_sequences[newest], last);
+                    RaisePending(last);
                     return;
                 }
+
+                // A new sample is due: what was committed since the newest one belongs to it.
+                FoldPending(newest);
             }
 
             var at = (_start + _count) % Capacity;
@@ -65,7 +83,30 @@ internal sealed class CommitTimeline
 
             _sequences[at] = last;
             _ticks[at] = nowTicks;
+            Volatile.Write(ref _newestTicks, nowTicks);
         }
+    }
+
+    private void RaisePending(long last)
+    {
+        var seen = Volatile.Read(ref _pending);
+        while (last > seen)
+        {
+            var was = Interlocked.CompareExchange(ref _pending, last, seen);
+            if (was == seen)
+            {
+                return;
+            }
+
+            seen = was;
+        }
+    }
+
+    /// <summary>Moves what was committed since the newest sample into it. Called under <c>_sync</c>.</summary>
+    private void FoldPending(int newest)
+    {
+        var pending = Interlocked.Exchange(ref _pending, 0);
+        _sequences[newest] = Math.Max(_sequences[newest], pending);
     }
 
     /// <summary>
@@ -77,6 +118,11 @@ internal sealed class CommitTimeline
     {
         lock (_sync)
         {
+            if (_count > 0)
+            {
+                FoldPending((_start + _count - 1) % Capacity);
+            }
+
             for (var i = 0; i < _count; i++)
             {
                 var at = (_start + i) % Capacity;

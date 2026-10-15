@@ -20,12 +20,12 @@ Crystal is a kernel, not a database server. It has no query language, documents,
 failover policy: the product built on top decides those. See [`product/intro.md`](product/intro.md) for what Crystal is
 and is not, and [`engineering/box-layout.md`](engineering/box-layout.md) for how the bytes are laid out.
 
-> **Status: `1.0.0-rc.1`, a release candidate for 1.0.** The storage kernel is complete. Tested on Windows and Linux. Changes per version: [`CHANGELOG.md`](CHANGELOG.md).
+> **Status: `1.0.0-rc.2`, a release candidate for 1.0.** The storage kernel is complete. Tested on Windows and Linux. Changes per version: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
 ```sh
-dotnet add package SystemD.Crystal --version 1.0.0-rc.1
+dotnet add package SystemD.Crystal --version 1.0.0-rc.2
 ```
 
 Requires .NET 10. The package brings RocksDB's native libraries with it (the `RocksDB` package, pinned to one exact
@@ -248,6 +248,23 @@ lets it rejoin as a standby:
 standby.Replication.StopFollowing();
 long epoch = standby.Replication.Promote("node-a unreachable");  // a higher epoch: the old primary is outranked
 ```
+
+**Shipping in batches.** Each page a standby applies costs it a synced write, so a primary does not send one page per
+commit: a standby near the head is answered at most once per **gather window**, and the commits of the window arrive
+together. A standby catching up is answered at once. The window trades a little lag for commit latency; the default
+suits most workloads:
+
+```csharp
+Replication = new ReplicationOptions
+{
+    Secret = Environment.GetEnvironmentVariable("CRYSTAL_SECRET")!,
+    GatherWindow = TimeSpan.FromMilliseconds(10), // the default; TimeSpan.Zero ships every commit at once (0 to 1 s)
+},
+```
+
+The wait is a timer, so it lasts at least the operating system's timer resolution (about 15.6 ms on Windows). Under
+Highway's load harness it brought a Strict commit with a standby attached from 3.5 ms to 2.2 ms, the same as with no
+standby, for a standby lag of about one window ([`engineering/measurements.md`](engineering/measurements.md)).
 
 Epochs fence a stale primary. A standby that applied past the point where the new primary's history diverges is
 detected and re-bootstrapped, never left holding writes the primary never had. Crystal guarantees these mechanics;

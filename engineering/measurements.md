@@ -142,3 +142,41 @@ standby byte-identical in count across 50 databases after a 20 000-batch catch-
 [{"workload":"replication","phase":"bootstrap","databases":50,"ms":10378.3087},{"workload":"replication","phase":"catchup","batches":20000,"catchUpMs":828.5986,"perBatchUs":41.4299},{"workload":"replication","phase":"idle","stable":1}]
 ```
 
+
+## 2026-10-16 · spec 014 · Highway's load harness
+
+**Conditions:** Release · Microsoft Windows 10.0.26200 · 22 logical · 31,4 GB · .NET 10 · RocksDB 11.8.1.5032 · one
+laptop. Highway's harness (`internal/features/076-highway-on-crystal/crystal/profilerun.ps1` in Highway's repository):
+the published Highway host as a primary and a standby on the same machine and disk, 70 s of steady load,
+`dotnet-counters` on the primary for 30 s past warm-up; durability Strict. Crystal packed locally for each row, except
+rc.1 published. Two runs a side unless stated. The harness's offered load is 5 880 RPC calls; this day it did not
+saturate (spec 014's table, recorded another day, did).
+
+| Crystal on the primary | Commit p50 | Commit p95 | RPC p50 | RPC p99 | RPC handled / failed | Queue e2e p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1.0.0-rc.1, published (×2) | 3.52–3.54 ms | 3.82–3.85 | 3.71–3.72 ms | 8.59–8.74 | 5 880 / 0 | 67.5–68.7 ms |
+| rc.1 source, packed locally (×1) | 3.55 | 3.79 | 3.72 | 8.83 | 5 880 / 0 | 65.7 |
+| rc.1, per-commit replication hook removed (×1) | 2.20 | 2.84 | 2.42 | 7.64 | 5 880 / 0 | 22.9 |
+| 014 with a 2 ms gather window (×2) | 3.54–3.55 | 3.81–3.82 | 3.72–3.73 | 8.28–8.29 | 5 880 / 0 | 66.2–66.6 |
+| **014 as built, 10 ms window (×2)** | **2.18–2.22** | 2.84–2.93 | **2.40–2.45** | 6.21–6.81 | 5 880 / 0 | **22.1–23.4** |
+| 014 as built, no standby attached (×1) | 2.17 | 2.71 | 2.47 | 6.87 | 5 880 / 0 | 23.4 |
+| 014, `DeleteHeavy` scan-flush triggers off (×2) | 2.07–2.15 | 2.73–2.93 | 2.35–2.51 | 6.29–6.77 | 5 880 / 0 | 24.2–26.2 |
+| Highway 3.0 on its own store, reference (×1) | — | — | 3.38 | 8.03 | 5 880 / 0 | 48.1 |
+
+**Pages and the WAL (R4.1).** On rc.1 the primary served 15 854 database pages for 16 070 Strict commits in 30 s, every
+one from the tail: one page per commit, no page from the WAL, none missed for a batch still landing. Built, it served
+1 837–1 863 pages in 30 s (the 10 ms window rounds up to Windows' 15.6 ms timer). R4.2 was not needed.
+
+**What cost the time.** Not the pulls themselves: each page costs the standby a synced write, and on one disk a page
+per commit doubled the fsyncs under the primary's commits. In-process (a primary and a standby store, one writer, 10 s),
+Strict commit p50 was 1.04 ms with no standby, 1.84 ms with one at gather 0 or 2 ms, and 1.05 ms at 5 ms or wider;
+with eight writers, 2.31, 3.67 and 2.28 ms. A 2 ms window is shorter than the standby's own cycle (reply, synced
+apply, next pull), so it gathered nothing.
+
+**Lag (R3.1, not met as defined).** `crystal.replication.lag_time`, read once a second by `dotnet-counters`: median
+14–15 ms (R3.1: at most 10 ms), p99 16 and 46 ms, max 46 ms. Those reads tick on the same 15.6 ms timer as the window, so they land at the end of a window, when
+lag is at its largest. Sampled at irregular moments by a spinning thread in the in-process pair (one writer, 10 ms
+window, about 5 000 samples): median 9.3 ms, p99 21.7 ms, mean 9.5 ms; with no window, median 2.0 ms.
+
+**Mixed versions (R8.1).** A 014 primary with an rc.1 standby, and the reverse, under the same load: the pair stayed
+healthy throughout and ended with the standby acknowledging the primary's latest sequence, no slot dropped.

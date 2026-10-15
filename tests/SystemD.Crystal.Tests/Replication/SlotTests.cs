@@ -165,6 +165,27 @@ public sealed class SlotTests
     }
 
     [Fact]
+    public async Task LagTime_WithinOneTimelineSample_IsExactFromTheTail()
+    {
+        // Spec 014 R3: two commits 30 ms apart fall in one 100 ms timeline sample, which dates both from the first; the
+        // tail keeps each batch's commit time, so a standby lacking only the second is 30 ms behind, not 80.
+        var clock = new ManualClock();
+        using var dir = new TempStoreDirectory();
+        using var primary = Primary(dir, Options(clock), out var db, writes: 0);
+        await using var standby = await Standby.Connect(primary);
+        var start = (long)db.Slot.LatestSequence;
+        await standby.Pull(db.Uid, from: start);
+
+        Write(db, 1);
+        clock.Advance(TimeSpan.FromMilliseconds(50));
+        Write(db, 1);
+        clock.Advance(TimeSpan.FromMilliseconds(30));
+
+        await standby.Pull(db.Uid, from: start + 1);
+        Assert.Equal(TimeSpan.FromMilliseconds(30), primary.Replication.Status().Slots.Single().LagTime);
+    }
+
+    [Fact]
     public async Task ADemotion_ClearsTheSlots()
     {
         var clock = new ManualClock();

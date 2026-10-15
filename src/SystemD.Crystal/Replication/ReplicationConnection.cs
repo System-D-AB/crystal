@@ -83,11 +83,9 @@ internal sealed class ReplicationConnection
     /// disconnects, a protocol error closes the connection, or the pre-<c>AUTH</c> timeout elapses.
     /// </summary>
     /// <remarks>
-    /// <b>Blocks a thread</b> (playbook § 7, spec 011 R11.10): a caught-up <c>PULL</c> waits on the primary for a change,
-    /// up to <c>LongPollMax</c>, with <c>Monitor.Wait</c> on the thread serving this connection (a thread-pool thread),
-    /// rather than an asynchronous wait: the wait must also be woken by commits made on writers' threads, and one thread
-    /// per standby connection, bounded by <c>MaxConnections</c>, is the cost accepted. Reads and writes of the stream
-    /// are asynchronous.
+    /// <b>Holds no thread while it waits</b> (playbook § 7, spec 014 R5): a caught-up <c>PULL</c> waits on the primary
+    /// for a change, up to <c>LongPollMax</c>, and a standby near the head waits out the gather window, both as
+    /// asynchronous waits that commits on writers' threads complete. Reads and writes of the stream are asynchronous.
     /// </remarks>
     public async Task ServeAsync(CancellationToken cancellationToken)
     {
@@ -152,7 +150,7 @@ internal sealed class ReplicationConnection
             default:
             {
                 var reply = new RespWriter();
-                if (!_source.TryHandle(command, request, _peerNodeId, reply))
+                if (!await _source.TryHandleAsync(command, request, _peerNodeId, reply, ct).ConfigureAwait(false))
                 {
                     reply = new RespWriter().Error($"{ReplicationProtocol.ErrArg} unknown command '{command}'");
                 }

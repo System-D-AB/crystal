@@ -220,6 +220,13 @@ public sealed class CrystalStore : IDisposable
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.SyncInterval, "CrystalOptions.SyncInterval must be from 1 ms to 10 s (spec 006 R2.1).");
         }
+
+        // Spec 014: a paced pull waits up to the window before it may long-poll, inside the standby's reply timeout; a
+        // window anywhere near that would stall every standby.
+        if (options.Replication is { } replication && (replication.GatherWindow < TimeSpan.Zero || replication.GatherWindow > TimeSpan.FromSeconds(1)))
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), replication.GatherWindow, "ReplicationOptions.GatherWindow must be from zero to 1 s (spec 014 R2.3).");
+        }
     }
 
     /// <summary>

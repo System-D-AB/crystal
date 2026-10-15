@@ -11,6 +11,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 using SystemD.Crystal.Replication;
 using SystemD.Crystal.Replication.Resp;
 using Text = System.Text.Encoding;
@@ -58,7 +59,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         _slotTimer = engine.Clock.CreateTimer(_ => AgeSlotsQuietly(), null, period, period);
 
         // A change of the replicated set wakes a waiting pull at once (spec 011 R11.1, 003 R3.4), as a commit does.
-        engine.RegistryChanged += _change.Signal;
+        engine.RegistryChanged += _change.SignalUrgent;
     }
 
     private readonly ITimer _slotTimer;
@@ -80,6 +81,12 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     /// <summary>Called with the batch bytes of each pull reply sent (spec 011 R10.1).</summary>
     internal Action<long>? OnShipped { get; set; }
+
+    /// <summary>
+    /// Called for each database page served with batches (spec 014 R4.1, R3): its UID, whether it came from the tail
+    /// (else the WAL, with why the tail missed), and for a tail page how long ago its oldest batch was committed.
+    /// </summary>
+    internal Action<string, bool, TailMiss, TimeSpan?>? OnPageServed { get; set; }
 
     public void ObservePeer(long peerEpoch, string peerRole, string peerNodeId, string? peerEndpoint = null)
     {
@@ -310,7 +317,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
         return after;
     }
 
-    public bool TryHandle(string command, IReadOnlyList<byte[]> args, string peerNodeId, RespWriter reply)
+    public async ValueTask<bool> TryHandleAsync(string command, IReadOnlyList<byte[]> args, string peerNodeId, RespWriter reply, CancellationToken cancellationToken)
     {
         switch (command)
         {
@@ -318,7 +325,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
                 HandleDatabases(reply);
                 return true;
             case ReplicationProtocol.Pull:
-                HandlePull(args, peerNodeId, reply);
+                await HandlePullAsync(args, peerNodeId, reply, cancellationToken).ConfigureAwait(false);
                 return true;
             case ReplicationProtocol.Snapshot:
                 HandleSnapshot(args, reply);
@@ -372,8 +379,10 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     // --------------------------------------------------------------------- PULL
 
-    private void HandlePull(IReadOnlyList<byte[]> args, string peerNodeId, RespWriter reply)
+    private async ValueTask HandlePullAsync(IReadOnlyList<byte[]> args, string peerNodeId, RespWriter reply, CancellationToken cancellationToken)
     {
+        // Taken first, so a role or epoch change at any point of this pull ends its pacing (spec 014 review).
+        var urgentMark = _change.UrgentMark;
         if (!IsPrimary(reply))
         {
             return;
@@ -411,16 +420,23 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
         AgeSlots(); // R2.3: every contact re-evaluates every slot
 
+        // Spec 014 R2.3: a standby near the head is answered at most once per gather window, so the commits of the window
+        // ship together; one catching up is answered at once (R2.4).
+        await PaceAsync(peerNodeId, urgentMark, cancellationToken).ConfigureAwait(false);
+
         // The mark is taken BEFORE building entries, so a change that lands after the build still wakes the wait below.
         // Build the entries once; if every database is caught up and nothing is to be sent, wait for a commit, a
-        // set-version change, or an epoch or role change, up to waitMs, then build once more.
+        // set-version change, or an epoch or role change, up to waitMs, then build once more. The wait holds no thread
+        // (spec 014 R5).
         var epoch = _epoch.Epoch;
         var mark = _change.Mark;
-        var entries = BuildEntries(requests, maxBytes);
-        if (waitMs > 0 && NothingToSend(entries) && WaitForChange(mark, waitMs))
+        var entries = BuildEntries(requests, maxBytes, out var behind);
+        if (waitMs > 0 && NothingToSend(entries) && await WaitForChangeAsync(mark, waitMs, cancellationToken).ConfigureAwait(false))
         {
-            entries = BuildEntries(requests, maxBytes);
+            entries = BuildEntries(requests, maxBytes, out behind);
         }
+
+        _pace[peerNodeId] = new PullPace(_engine.Clock.GetTimestamp(), behind);
 
         // The role and epoch are checked again before answering (003 should-fix 5): a node that stood down, or moved to
         // another epoch, while this pull waited answers as not primary rather than stamping entries with a history it
@@ -605,8 +621,11 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
     /// <paramref name="maxBytes"/> plus one batch: a batch is never split, so the last one may cross the limit. The
     /// first database served rotates from pull to pull, so one database far behind cannot starve the others.
     /// </summary>
-    private List<Entry> BuildEntries(List<(string Uid, long From)> requests, int maxBytes)
+    private List<Entry> BuildEntries(List<(string Uid, long From)> requests, int maxBytes, out bool behind)
     {
+        // Whether this reply leaves the standby behind (spec 014 R2.4): a page cut short, a page read from the WAL, or
+        // anything but a plain entry. Its next pull is then answered at once, not paced.
+        behind = false;
         var entries = new Entry[requests.Count];
         var remaining = (long)maxBytes;
         var first = requests.Count == 0 ? 0 : (int)((uint)Interlocked.Increment(ref _nextFirst) % (uint)requests.Count);
@@ -631,9 +650,17 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
             }
 
             var batches = new List<(ulong Seq, byte[] Data)>();
+            ServeSource source = default;
+            ulong? more = null;
             var result = remaining > 0
-                ? serving.Serve(from, (int)remaining, batches, out _)
+                ? serving.Serve(from, (int)remaining, batches, out more, out source)
                 : serving.Position(from);
+            if (more is not null || remaining <= 0 || result != ServeResult.Served && result != ServeResult.CaughtUp
+                || result == ServeResult.Served && !source.FromTail)
+            {
+                behind = true;
+            }
+
 
             // A batch too large for any reply is never sent: the standby could not read the reply, and would ask again
             // forever (spec 011 R4.1). It re-bootstraps this database instead; the others are served as usual.
@@ -648,12 +675,24 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
                 remaining -= data.Length;
             }
 
+            // Counted once it is known to ship (spec 014 R4.1): after the oversize check above.
+            if (result == ServeResult.Served && batches.Count > 0 && OnPageServed is { } onPageServed)
+            {
+                TimeSpan? delay = source.FromTail && source.CommittedAt is { } committedAt ? _engine.Clock.GetElapsedTime(committedAt) : null;
+                onPageServed(uid, source.FromTail, source.Miss, delay);
+            }
+
             entries[i] = result switch
             {
                 ServeResult.Diverged => Entry.Diverged(uid, serving),
                 ServeResult.Gap => Entry.GapAt(uid, serving, serving.FirstAvailable()),
                 _ => Entry.Ok(uid, serving, batches),
             };
+        }
+
+        foreach (var entry in entries)
+        {
+            behind |= entry.Status != ReplicationProtocol.EntryOk;
         }
 
         return [.. entries];
@@ -947,14 +986,43 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     private void Signal() => _change.Signal();
 
-    private bool WaitForChange(long mark, int waitMs)
+    private ValueTask<bool> WaitForChangeAsync(long mark, int waitMs, CancellationToken cancellationToken)
     {
         _engine.RunHook("pull.waiting"); // tests: act only once a pull is really waiting
-        return _change.WaitForChange(mark, waitMs);
+        return _change.WaitForChangeAsync(mark, TimeSpan.FromMilliseconds(waitMs), _engine.Clock, cancellationToken);
     }
 
+    /// <summary>
+    /// The gather window (spec 014 R2.3): a standby whose previous reply was neither a full page nor read from the WAL is
+    /// answered no sooner than <see cref="ReplicationOptions.GatherWindow"/> after it, so the commits of the window ship in
+    /// one reply. A standby catching up is answered at once (R2.4), and an urgent change (role, epoch, database set) ends
+    /// the wait. Waits without holding a thread (R5).
+    /// </summary>
+    private async ValueTask PaceAsync(string peerNodeId, long urgentMark, CancellationToken cancellationToken)
+    {
+        var window = _options.GatherWindow;
+        if (window <= TimeSpan.Zero || !_pace.TryGetValue(peerNodeId, out var last) || last.Behind)
+        {
+            return;
+        }
+
+        var left = window - _engine.Clock.GetElapsedTime(last.At);
+        if (left <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        _engine.RunHook("pull.pacing"); // tests: act only once a pull is really pacing
+        await _change.WaitForUrgentAsync(urgentMark, left, _engine.Clock, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>When a standby was last answered, and whether that reply left it behind (spec 014 R2.3, R2.4).</summary>
+    private readonly record struct PullPace(long At, bool Behind);
+
+    private readonly ConcurrentDictionary<string, PullPace> _pace = new(StringComparer.Ordinal);
+
     /// <summary>Wakes every waiting pull: the role or epoch changed (R3.4), and each must answer for the new state.</summary>
-    internal void SignalRoleOrEpochChange() => _change.Signal();
+    internal void SignalRoleOrEpochChange() => _change.SignalUrgent();
 
     private bool IsPrimary(RespWriter reply)
     {
@@ -976,7 +1044,7 @@ internal sealed class ReplicationSource : IReplicationSource, IDisposable
 
     public void Dispose()
     {
-        _engine.RegistryChanged -= _change.Signal;
+        _engine.RegistryChanged -= _change.SignalUrgent;
         lock (_dbGate)
         {
             if (_disposed)

@@ -30,7 +30,14 @@ internal sealed class DatabaseReplication
     public CommitTimeline Timeline { get; } = new();
 
     /// <summary>The age of the oldest batch a standby at <paramref name="acknowledged"/> lacks (R2.4, R12.1).</summary>
-    public TimeSpan LagTime(long acknowledged) => Timeline.AgeAfter(acknowledged, _clock.GetUtcNow().UtcTicks);
+    public TimeSpan LagTime(long acknowledged)
+    {
+        // Exact when the tail still holds the first batch the standby lacks (spec 014 R3); the timeline's 100 ms samples
+        // otherwise, for a standby further behind than the tail.
+        return Tail.CommittedAtAfter((ulong)acknowledged) is { } committedAt
+            ? _clock.GetElapsedTime(committedAt)
+            : Timeline.AgeAfter(acknowledged, _clock.GetUtcNow().UtcTicks);
+    }
 
     public DatabaseReplication(string uid, DatabaseSlot slot, long tailBytes, TimeProvider clock, Action? onCommit = null)
     {
@@ -49,7 +56,7 @@ internal sealed class DatabaseReplication
         _clock = clock;
         _instance.OnCommitted = bytes =>
         {
-            Tail.Add(bytes);
+            Tail.Add(bytes, clock.GetTimestamp());
             Timeline.Committed(bytes, clock.GetUtcNow().UtcTicks);
             onCommit?.Invoke();
         };
@@ -111,9 +118,17 @@ internal sealed class DatabaseReplication
     /// <paramref name="maxBytes"/> (spec 003 design § 4): from the tail if it holds the cursor, else from the WAL.
     /// Returns the serve outcome; <paramref name="more"/> is the first sequence left out by the byte cap, or null.
     /// </summary>
-    public ServeResult Serve(long fromSeq, int maxBytes, List<(ulong Seq, byte[] Data)> into, out ulong? more)
+    public ServeResult Serve(long fromSeq, int maxBytes, List<(ulong Seq, byte[] Data)> into, out ulong? more) =>
+        Serve(fromSeq, maxBytes, into, out more, out _);
+
+    /// <summary>
+    /// As <see cref="Serve(long, int, List{ValueTuple{ulong, byte[]}}, out ulong?)"/>, also saying where the batches came
+    /// from (spec 014 R4.1): the tail, with when its first batch was committed, or the WAL, with why the tail missed.
+    /// </summary>
+    public ServeResult Serve(long fromSeq, int maxBytes, List<(ulong Seq, byte[] Data)> into, out ulong? more, out ServeSource source)
     {
         more = null;
+        source = default;
         Tail.Enable();
 
         var latest = Latest;
@@ -130,10 +145,13 @@ internal sealed class DatabaseReplication
 
         // Serve from memory when the tail holds the cursor (a standby just behind). GetUpdatesSince re-reads the live
         // WAL from its start, so this keeps a near-caught-up pull's cost off the WAL (design § 3).
-        if (Tail.TryRead((ulong)fromSeq, maxBytes, into, out more))
+        if (Tail.TryRead((ulong)fromSeq, maxBytes, into, out more, out var committedAt))
         {
+            source = new ServeSource(FromTail: true, committedAt, TailMiss.Behind);
             return ServeResult.Served;
         }
+
+        source = new ServeSource(FromTail: false, null, Tail.ClassifyMiss((ulong)fromSeq));
 
         // Behind the tail: read from the WAL through a held reader, continuing one kept from the previous page when its
         // next sequence matches (design § 3), chunk after chunk until the page is full (R3.2, 003 addendum B4). The
@@ -222,6 +240,12 @@ internal sealed class DatabaseReplication
         set => _readers.OnClearTaken = value;
     }
 }
+
+/// <summary>
+/// Where a served page came from (spec 014 R4.1): the tail, with the store-clock timestamp its first batch was committed at
+/// (null if unknown), or the WAL, with why the tail missed.
+/// </summary>
+internal readonly record struct ServeSource(bool FromTail, long? CommittedAt, TailMiss Miss);
 
 /// <summary>The outcome of serving one database in a pull (spec 003 design § 4).</summary>
 internal enum ServeResult

@@ -526,6 +526,7 @@ public sealed class CrystalReplication : IDisposable
                 OnEvent = Raise,
                 OnReport = path => LastReconciliationReport = path,
                 OnShipped = bytes => _metrics.BytesShipped(bytes),
+                OnPageServed = (uid, fromTail, miss, delay) => _metrics.PageServed(uid, fromTail, miss == Replication.TailMiss.Landing, delay),
             };
         }
     }

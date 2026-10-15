@@ -38,7 +38,10 @@ internal interface IReplicationSource
     /// handles itself): <c>DATABASES</c>, <c>PULL</c>, <c>SNAPSHOT</c>. The handler writes the reply (or an error) via
     /// <paramref name="reply"/>. <paramref name="peerNodeId"/> is the authenticated standby's node id (from its
     /// <c>HELLO</c>), so a slot can be keyed per standby (R2.3, R9.2). Returns false for an unknown command, so the
-    /// connection answers <c>CRYSTAL_ARG</c>.
+    /// connection answers <c>CRYSTAL_ARG</c>. A <c>PULL</c> may wait (its long poll, the gather window) without holding a
+    /// thread (spec 014 R5); <paramref name="cancellationToken"/> ends the wait when the connection closes.
     /// </summary>
-    bool TryHandle(string command, IReadOnlyList<byte[]> args, string peerNodeId, Replication.Resp.RespWriter reply);
+    System.Threading.Tasks.ValueTask<bool> TryHandleAsync(
+        string command, IReadOnlyList<byte[]> args, string peerNodeId, Replication.Resp.RespWriter reply,
+        System.Threading.CancellationToken cancellationToken);
 }

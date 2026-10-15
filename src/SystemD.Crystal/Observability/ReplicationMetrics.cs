@@ -32,6 +32,8 @@ internal sealed class ReplicationMetrics : IDisposable
     private readonly Counter<long> _bytesApplied;
     private readonly Counter<long> _framesRefused;
     private readonly Counter<long> _bytesShipped;
+    private readonly Counter<long> _pullSource;
+    private readonly Histogram<double> _shipDelay;
     private readonly Func<IReadOnlyList<FollowedDatabase>> _followed;
 
     private readonly Func<long> _epoch;
@@ -82,6 +84,10 @@ internal sealed class ReplicationMetrics : IDisposable
         _bytesShipped = _meter.CreateCounter<long>("crystal.replication.bytes_shipped", "By", "Batch bytes a primary sent in pull replies (spec 011 R10.1, 003 R13.1).");
         _meter.CreateObservableGauge("crystal.replication.standby_lag", StandbyLag, "{sequence}",
             "Sequences this standby lacks of its primary's latest, from the last reply (spec 011 R10.4): the worst, or per database when tagged.");
+        _pullSource = _meter.CreateCounter<long>("crystal.replication.pull.source", "{page}",
+            "Database pages a primary served with batches, by source: its in-memory tail or the WAL; a WAL page is tagged with why the tail missed (spec 014 R4.1).");
+        _shipDelay = _meter.CreateHistogram<double>("crystal.replication.ship_delay", "s",
+            "Time from commit to shipping of the oldest batch of each page served from the tail: the primary's share of a standby's lag (spec 014 R3).");
         _framesRefused = _meter.CreateCounter<long>("crystal.replication.frames_refused", "{frame}", "Frames refused for exceeding a size cap, by the side that refused them (spec 011 R4.3).");
 
         _meter.CreateObservableGauge("crystal.replication.epoch", () => _epoch(), "{epoch}", "This node's current replication epoch (R6).");
@@ -156,6 +162,33 @@ internal sealed class ReplicationMetrics : IDisposable
 
     /// <summary>A snapshot bootstrap installed (R13.1).</summary>
     public void Bootstrapped() => _bootstraps.Add(1);
+
+    /// <summary>
+    /// A database page a primary served with batches (spec 014 R4.1, R3): from the tail, with how long ago its oldest batch
+    /// was committed, or from the WAL, tagged with whether the tail missed because the next batch was still landing.
+    /// </summary>
+    public void PageServed(string uid, bool fromTail, bool landing, TimeSpan? delay)
+    {
+        var source = new KeyValuePair<string, object?>("crystal.pull.source", fromTail ? "tail" : "wal");
+        var miss = new KeyValuePair<string, object?>("crystal.pull.miss", fromTail ? "none" : landing ? "landing" : "behind");
+        if (_tagWithDatabase)
+        {
+            var database = new KeyValuePair<string, object?>("crystal.database", _databaseName(uid) ?? uid);
+            _pullSource.Add(1, source, miss, database);
+            if (delay is { } d)
+            {
+                _shipDelay.Record(d.TotalSeconds, database);
+            }
+        }
+        else
+        {
+            _pullSource.Add(1, source, miss);
+            if (delay is { } d)
+            {
+                _shipDelay.Record(d.TotalSeconds);
+            }
+        }
+    }
 
     /// <summary>Batch bytes a primary put in a pull reply (spec 011 R10.1).</summary>
     public void BytesShipped(long bytes)

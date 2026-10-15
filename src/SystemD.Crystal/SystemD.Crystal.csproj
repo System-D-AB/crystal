@@ -12,7 +12,7 @@
   <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>SystemD.Crystal</PackageId>
-    <Version>1.0.0-rc.1</Version>
+    <Version>1.0.0-rc.2</Version>
     <Authors>SystemD.Crystal contributors</Authors>
     <Description>An embeddable storage engine for .NET, built on a write-ahead log over RocksDB: databases, boxes (named ordered key spaces) and records; atomic batches across boxes; snapshots and bounded ordered scans; durability you choose; primary/standby replication; incremental online backup and restore; format stamps.</Description>
     <PackageTags>storage;embedded;key-value;database;rocksdb;wal;replication;backup</PackageTags>

@@ -18,7 +18,7 @@ namespace SystemD.Crystal.Replication;
 /// fed from here can stand inside a WAL record; the WAL path trims such a record (<see cref="WriteBatchTrim"/>).</para>
 ///
 /// <para><b>Never a gap.</b> Committers add after their write, so adds can arrive out of order and a batch can be
-/// written but not yet added. Batches are kept sorted by sequence; <see cref="TryRead"/> returns only a contiguous
+/// written but not yet added. Batches are kept sorted by sequence; <see cref="TryRead(ulong, int, List{ValueTuple{ulong, byte[]}}, out ulong?)"/> returns only a contiguous
 /// run starting exactly at <c>fromSeq + 1</c>, stopping at the first hole. Anything it cannot answer is a miss, and
 /// the caller falls back to the WAL path with its gap checks. Capture is off until the first pull; cleared on any
 /// epoch or role change.</para>
@@ -28,7 +28,7 @@ internal sealed class ReplicationTail
     internal const long DefaultMaxBytes = 16L * 1024 * 1024;
     internal const int DefaultMaxBatches = 131_072;
 
-    private readonly record struct Entry(ulong Seq, ulong LastSeq, byte[] Data);
+    private readonly record struct Entry(ulong Seq, ulong LastSeq, byte[] Data, long? Timestamp);
 
     private readonly Lock _gate = new();
     private Entry[] _ring = new Entry[1024];   // circular, sorted by Seq from _head
@@ -85,9 +85,10 @@ internal sealed class ReplicationTail
 
     /// <summary>
     /// Record a batch just written. <paramref name="data"/> is the written batch's representation
-    /// (<c>[8B LE sequence][4B LE count]…</c>). Ownership passes to the tail.
+    /// (<c>[8B LE sequence][4B LE count]…</c>). Ownership passes to the tail. <paramref name="timestamp"/> is when it was
+    /// committed, on the store clock's timestamp scale (spec 014 R3: the delay from commit to ship), or null if unknown.
     /// </summary>
-    public void Add(byte[] data)
+    public void Add(byte[] data, long? timestamp = null)
     {
         if (!_capturing || data.Length < 12)
         {
@@ -101,7 +102,7 @@ internal sealed class ReplicationTail
             return; // not a written batch
         }
 
-        var entry = new Entry(seq, seq + Math.Max(count, 1u) - 1, data);
+        var entry = new Entry(seq, seq + Math.Max(count, 1u) - 1, data, timestamp);
         lock (_gate)
         {
             if (_count == _ring.Length)
@@ -141,9 +142,17 @@ internal sealed class ReplicationTail
     /// first batch always fits). False unless a held batch starts at exactly <c>fromSeq + 1</c> — the caller then
     /// uses the WAL. <paramref name="more"/> is the first sequence left out by the byte cap, or null.
     /// </summary>
-    public bool TryRead(ulong fromSeq, int maxBytes, List<(ulong Seq, byte[] Data)> into, out ulong? more)
+    public bool TryRead(ulong fromSeq, int maxBytes, List<(ulong Seq, byte[] Data)> into, out ulong? more) =>
+        TryRead(fromSeq, maxBytes, into, out more, out _);
+
+    /// <summary>
+    /// As <see cref="TryRead(ulong, int, List{ValueTuple{ulong, byte[]}}, out ulong?)"/>; <paramref name="firstTimestamp"/>
+    /// is when the first batch returned was committed (null if unknown or nothing was returned).
+    /// </summary>
+    public bool TryRead(ulong fromSeq, int maxBytes, List<(ulong Seq, byte[] Data)> into, out ulong? more, out long? firstTimestamp)
     {
         more = null;
+        firstTimestamp = null;
         var want = fromSeq + 1;
         lock (_gate)
         {
@@ -157,6 +166,7 @@ internal sealed class ReplicationTail
 
             ulong pageBytes = 0;
             var expected = At(i).Seq;
+            firstTimestamp = At(i).Timestamp;
             for (; i < _count; i++)
             {
                 var e = At(i);
@@ -177,6 +187,41 @@ internal sealed class ReplicationTail
             }
 
             return true;
+        }
+    }
+
+    /// <summary>
+    /// When the first batch after <paramref name="acknowledged"/> was committed, on the store clock's timestamp scale, if
+    /// the tail holds that batch and its time (spec 014 R3: a lag in time finer than the commit timeline's samples);
+    /// otherwise null.
+    /// </summary>
+    public long? CommittedAtAfter(ulong acknowledged)
+    {
+        var want = acknowledged + 1;
+        lock (_gate)
+        {
+            var i = Floor(want);
+            if (i >= 0 && At(i).LastSeq >= want)
+            {
+                return At(i).Timestamp; // the batch holding `want`
+            }
+
+            return i + 1 < _count && At(i + 1).Seq == want ? At(i + 1).Timestamp : null;
+        }
+    }
+
+    /// <summary>
+    /// Why <see cref="TryRead(ulong, int, List{ValueTuple{ulong, byte[]}}, out ulong?)"/> cannot answer
+    /// <paramref name="fromSeq"/> (spec 014 R4.1): <see cref="TailMiss.Landing"/> when the next batch is newer than
+    /// everything held — written, not yet added — and <see cref="TailMiss.Behind"/> otherwise (the cursor is older than
+    /// the tail, inside a merged batch, or the tail holds nothing).
+    /// </summary>
+    public TailMiss ClassifyMiss(ulong fromSeq)
+    {
+        var want = fromSeq + 1;
+        lock (_gate)
+        {
+            return _count > 0 && At(_count - 1).LastSeq < want ? TailMiss.Landing : TailMiss.Behind;
         }
     }
 
@@ -214,4 +259,14 @@ internal sealed class ReplicationTail
         _ring = next;
         _head = 0;
     }
+}
+
+/// <summary>Why a tail read missed (spec 014 R4.1).</summary>
+internal enum TailMiss
+{
+    /// <summary>The cursor is behind what the tail holds: a standby genuinely behind, served from the WAL.</summary>
+    Behind,
+
+    /// <summary>The next batch is newer than the tail's newest: committed, not yet added.</summary>
+    Landing,
 }

@@ -30,11 +30,12 @@ public sealed class ReplicationProtocolTests
 
         public void ObservePeer(long peerEpoch, string peerRole, string peerNodeId, string? peerEndpoint = null) { /* no-op in the protocol tests */ }
 
-        public bool TryHandle(string command, IReadOnlyList<byte[]> args, string peerNodeId, RespWriter reply)
+        public System.Threading.Tasks.ValueTask<bool> TryHandleAsync(
+            string command, IReadOnlyList<byte[]> args, string peerNodeId, RespWriter reply, System.Threading.CancellationToken cancellationToken)
         {
             // The protocol tests exercise the handshake/STATUS; other authenticated commands are not primary-served here.
             reply.Error($"{ReplicationProtocol.ErrNotPrimary} {Epoch} {Role}");
-            return true;
+            return System.Threading.Tasks.ValueTask.FromResult(true);
         }
     }
 

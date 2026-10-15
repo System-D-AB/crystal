@@ -76,6 +76,18 @@ public sealed class ReplicationOptions
     /// <summary>The longest a caught-up <c>PULL</c> waits before returning empty (R3.4).</summary>
     public TimeSpan LongPollMax { get; init; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How often, at most, a primary answers the pulls of a standby that is caught up or nearly so (spec 014 R2.3):
+    /// commits that land within the window ship together in one reply instead of one reply each. A standby catching up,
+    /// whose previous reply was a full page or came from the WAL, is answered at once (R2.4), and a change of role, epoch
+    /// or database set is never held back by it. <see cref="TimeSpan.Zero"/> answers every pull at once, as before 014.
+    /// The wait is a timer, so it lasts at least the operating system's timer resolution (about 15.6 ms on Windows by
+    /// default). From zero to 1 s. Default 10 ms: wider than a standby's own cycle (reply, apply with a synced write, next pull), so it
+    /// gathers; at 2 ms a standby whose commits arrive one at a time was still sent, and synced, one page per commit
+    /// (spec 014 design addendum).
+    /// </summary>
+    public TimeSpan GatherWindow { get; init; } = TimeSpan.FromMilliseconds(10);
+
     /// <summary>The maximum bytes in one <c>PULL</c> reply (R3.2).</summary>
     public int PageBytes { get; init; } = 1 << 20;
 
