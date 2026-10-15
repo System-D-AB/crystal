@@ -64,4 +64,46 @@ public sealed record StorageStatus(
     long PendingCompactionBytes,
     long SstFiles,
     long SstSize,
-    bool WriteStopped);
+    bool WriteStopped)
+{
+    /// <summary>SST files at each level, 0 to 6, summed over the database's column families (spec 012 R11).</summary>
+    public IReadOnlyList<long> FilesPerLevel { get; init; } = [];
+
+    /// <summary>Bytes in the active memtables, summed over the column families (spec 012 R11).</summary>
+    public long ActiveMemtableBytes { get; init; }
+
+    /// <summary>The rate, in bytes per second, RocksDB is slowing writes to; 0 when it is not (spec 012 R11).</summary>
+    public long DelayedWriteRate { get; init; }
+
+    /// <summary>Equal when every figure is, <see cref="FilesPerLevel"/> compared element by element.</summary>
+    public bool Equals(StorageStatus? other) =>
+        other is not null
+        && MemtableDeletes == other.MemtableDeletes
+        && EstimatedKeys == other.EstimatedKeys
+        && LiveDataSize == other.LiveDataSize
+        && PendingCompactionBytes == other.PendingCompactionBytes
+        && SstFiles == other.SstFiles
+        && SstSize == other.SstSize
+        && WriteStopped == other.WriteStopped
+        && ActiveMemtableBytes == other.ActiveMemtableBytes
+        && DelayedWriteRate == other.DelayedWriteRate
+        && System.Linq.Enumerable.SequenceEqual(FilesPerLevel, other.FilesPerLevel);
+
+    /// <inheritdoc/>
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(MemtableDeletes);
+        hash.Add(EstimatedKeys);
+        hash.Add(LiveDataSize);
+        hash.Add(SstFiles);
+        hash.Add(SstSize);
+        hash.Add(ActiveMemtableBytes);
+        foreach (var files in FilesPerLevel)
+        {
+            hash.Add(files);
+        }
+
+        return hash.ToHashCode();
+    }
+}

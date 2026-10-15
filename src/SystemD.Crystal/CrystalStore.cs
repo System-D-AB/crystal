@@ -206,6 +206,16 @@ public sealed class CrystalStore : IDisposable
             throw new ArgumentOutOfRangeException(nameof(options), options.Durability, "CrystalOptions.Durability is not a durability mode.");
         }
 
+        if (options.MaxKeyBytes is < 1 or > 1 << 20)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.MaxKeyBytes, "CrystalOptions.MaxKeyBytes must be from 1 to 1 MiB, or null (spec 012 R9).");
+        }
+
+        if (options.KeyLockStripes < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.KeyLockStripes, "CrystalOptions.KeyLockStripes must be at least 1 (spec 012 R3.7).");
+        }
+
         if (options.SyncInterval < TimeSpan.FromMilliseconds(1) || options.SyncInterval > TimeSpan.FromSeconds(10))
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.SyncInterval, "CrystalOptions.SyncInterval must be from 1 ms to 10 s (spec 006 R2.1).");

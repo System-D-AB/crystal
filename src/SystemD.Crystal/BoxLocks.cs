@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace SystemD.Crystal;
 
@@ -12,6 +13,9 @@ namespace SystemD.Crystal;
 /// in ascending order, so two multi-box lockers cannot deadlock. Locks are <b>not re-entrant</b> (R5.4): a thread that
 /// locks a box it already holds waits like any other. A lock is released through the object it returns, on whichever
 /// thread disposes it, so it may be held across an <c>await</c>.
+/// <para>The async forms (spec 012 R3.4) wait without blocking a thread and honour cancellation. Box locks are
+/// <b>independent of <see cref="KeyLocks"/></b>: a box lock does not exclude key locks in that box (R3.5), and
+/// <see cref="LockAll"/> takes every box stripe and no key stripe.</para>
 /// </summary>
 public sealed class BoxLocks
 {
@@ -79,6 +83,63 @@ public sealed class BoxLocks
         return Take(all);
     }
 
+    /// <summary>
+    /// Acquires the lock for <paramref name="box"/> without blocking a thread (spec 012 R3.4). Dispose the result, or
+    /// <c>await using</c> it, to release it.
+    /// </summary>
+    public ValueTask<LockLease> LockAsync(Box box, CancellationToken cancellationToken = default) =>
+        TakeAsync([StripeOf(box.Id)], cancellationToken);
+
+    /// <summary>
+    /// Acquires the locks for all distinct stripes of <paramref name="boxes"/> without blocking a thread, in ascending
+    /// stripe order (spec 012 R3.4). A cancellation or failure releases every stripe already taken.
+    /// </summary>
+    public ValueTask<LockLease> LockManyAsync(IEnumerable<Box> boxes, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(boxes);
+        var stripes = new SortedSet<int>();
+        foreach (var box in boxes)
+        {
+            stripes.Add(StripeOf(box.Id));
+        }
+
+        return TakeAsync([.. stripes], cancellationToken);
+    }
+
+    private async ValueTask<LockLease> TakeAsync(int[] ascendingStripes, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested(); // a cancelled caller takes nothing, contended or not
+        var taken = new List<int>(ascendingStripes.Length);
+        try
+        {
+            foreach (var stripe in ascendingStripes)
+            {
+                OnStripeWaiting?.Invoke(stripe);
+                if (!_stripes[stripe].Wait(0))
+                {
+                    var start = _metrics?.Start() ?? 0;
+                    OnStripeContended?.Invoke(stripe);
+                    await _stripes[stripe].WaitAsync(cancellationToken).ConfigureAwait(false);
+                    _metrics?.LockWait(start, Observability.CrystalMetrics.BoxScope);
+                }
+
+                taken.Add(stripe);
+            }
+        }
+        catch
+        {
+            for (var i = taken.Count - 1; i >= 0; i--)
+            {
+                _stripes[taken[i]].Release();
+            }
+
+            throw;
+        }
+
+        var lease = new Lease(this, taken);
+        return new LockLease(lease.Dispose);
+    }
+
     private Lease Take(int[] ascendingStripes)
     {
         var taken = new List<int>(ascendingStripes.Length);
@@ -93,7 +154,7 @@ public sealed class BoxLocks
                     var start = _metrics?.Start() ?? 0;
                     OnStripeContended?.Invoke(stripe);
                     _stripes[stripe].Wait();
-                    _metrics?.LockWait(start);
+                    _metrics?.LockWait(start, Observability.CrystalMetrics.BoxScope);
                 }
 
                 taken.Add(stripe);

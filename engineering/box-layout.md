@@ -167,6 +167,14 @@ An **encoder version**, part of the format, refuses data written with different 
 
 The helpers are conveniences. A product may encode its keys any way it likes; Crystal only compares bytes.
 
+- **`KeyWriter` and `KeyReader`** (`012`): the writer builds a composite key field by field; the reader reads it back
+  in the same order, each field ascending or descending (a descending field is the writer's `InvertLast`). A truncated
+  or malformed key throws `FormatException` naming the type and the offset; the reader never reads past its key.
+- **`KeyRanges`** (`012`) builds the half-open `KeyRange` a scan, a range delete or an estimate takes: `Point(key)`,
+  `Prefix(prefix)`, `Between(lower, upper)` with each side inclusive, exclusive or unbounded, and `PrefixEnd(prefix)`,
+  the least key above every key with that prefix (empty, the box's end, when the prefix is all `0xFF`). An empty bound
+  is the box's start or end; `KeyRange.Empty` holds no key.
+
 ## 6. Writes
 
 - **A batch** holds puts, deletes and range deletes on any keys of any boxes of one database, and commits atomically
@@ -174,6 +182,12 @@ The helpers are conveniences. A product may encode its keys any way it likes; Cr
 - **A batch reads its own writes** before it commits: a read through the batch sees the batch's pending changes over
   the committed state.
 - **An empty batch writes nothing and syncs nothing.**
+- **A batch reports what it holds** (`012`): `Count`, the operations staged, and `Bytes`, the keys, values and range
+  ends the product passed (Crystal's box prefix not counted). Both are zero after a commit or dispose, so a product
+  loading in pages bounds each batch by bytes.
+- **A key size limit, when set** (`CrystalOptions.MaxKeyBytes`, `012`): a longer key or range end is refused with
+  `KeyTooLargeException` when it is staged. Off by default; reads are not checked; a standby applies whatever its
+  primary committed.
 - **A range delete stays inside its box.** Its start may not sort after its end, which is refused when the delete is
   added; an empty end means the end of the box, as it does for a scan.
 - **Every write reaches RocksDB through one commit point** (`RocksInstance.Write`), checked on the built assembly.
@@ -197,13 +211,27 @@ The helpers are conveniences. A product may encode its keys any way it likes; Cr
   two multi-box writers cannot deadlock. A writer whose plan keeps changing under its locks may take every stripe
   (`LockAll`). The locks are **not re-entrant**: a thread that locks a box it holds waits like any other. A lock is
   released through the object it returns, on whichever thread disposes it, so it may be held across an `await`.
-  Internal `StripeWaiting` / `StripeReleasing` hooks let concurrency tests act at an exact interleaving.
+  Internal `StripeWaiting` / `StripeReleasing` hooks let concurrency tests act at an exact interleaving. Box locks
+  also have async forms (`LockAsync`, `LockManyAsync`, `012`) that wait without blocking a thread and honour
+  cancellation; a cancelled multi-box lock releases what it took.
+- **Key locks** (`CrystalDatabase.KeyLocks`, `012`) lock a key in a box, in their own stripe table
+  (`CrystalOptions.KeyLockStripes`, 256 by default): the stripe is a hash of the box id and the key's bytes. Several
+  keys are taken in ascending stripe order, sync or async. **Key locks and box locks are independent:** a box lock does
+  not exclude key locks in that box, and `LockAll` takes no key stripe. Both return a `LockLease`, disposable and
+  async-disposable.
 
 ## 7. Reads
 
 - **A snapshot** gives a consistent view of one database: every read through it sees the same committed state.
 - **Scans are bounded** both ways. Every iterator carries a lower and an upper bound inside one box, and stops at its
   limit.
+- **Scans go either way** (`012`). A backward scan of `[from, to)` on a snapshot returns the keys the forward scan
+  would, in descending order: from the greatest key strictly below `to` (a key equal to `to` is never returned) down
+  to `from`. A batch's scan is forward only.
+- **Range size estimates** (`CrystalDatabase.ApproximateBytes`, `012`): RocksDB's estimate of the bytes a range of
+  one box occupies, memtables and table files included, one range or several in one native call. It never scans. It
+  is approximate, consistent with no snapshot, and 0 does not mean empty; turning bytes into a number of entries is
+  the product's.
 
 ## 8. Profiles
 

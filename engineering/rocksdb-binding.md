@@ -50,7 +50,7 @@ else calls `Native.Instance` or declares a native import. Each method follows on
 |---|---|---|
 | `CompactOnDeletions` | `rocksdb_options_add_compact_on_deletion_collector_factory_del_ratio` | compact SST files full of deletions (the `DeleteHeavy` profile) |
 | `MemtableScanFlushTriggers` | `..._set_memtable_op_scan_flush_trigger`, `..._set_memtable_avg_op_scan_flush_trigger` | flush the memtable when a scan steps over too many deleted entries |
-| `ApproximateSizes` | `rocksdb_size_approximation_options_create` / `_set_include_memtables` / `_set_include_files` / `_destroy`, `rocksdb_approximate_sizes_cf_with_options` | cheap size estimates of key ranges, including memtable data |
+| `ApproximateSizes` | `rocksdb_size_approximation_options_create` / `_set_include_memtables` / `_set_include_files` / `_destroy`, `rocksdb_approximate_sizes_cf_with_options` | cheap size estimates of key ranges, including memtable data; public through `CrystalDatabase.ApproximateBytes` (`012`) |
 | `FlushWal` | `rocksdb_flush_wal` (synced) | the interval durability mode's timed WAL sync |
 | `CreateWriteBufferManager` / `SetWriteBufferManager` / `DestroyWriteBufferManager` | `rocksdb_write_buffer_manager_create_with_cache`, `rocksdb_options_set_write_buffer_manager`, `rocksdb_write_buffer_manager_destroy` | one write-buffer budget across the store's databases (§ 5) |
 
@@ -96,7 +96,12 @@ and frees them when the store closes.
   after a crash is dropped rather than refusing the whole log; **WAL compression is off** (trap R4.5), so the log can
   be decoded for replication's tail, trimming and reconciliation reports.
 - **Reads:** `Get` on the shared point-read options; bounded, limited, snapshot-pinned scans through
-  `BoundedIterator`.
+  `BoundedIterator`, forward (`Seek`, then `Next`) or backward (`012`: `SeekForPrev` to the upper bound, then `Prev`).
+  The iterate bounds on the read options keep a backward scan inside `[from, to)`: RocksDB places a `SeekForPrev` at or
+  above the upper bound on the last key below it. Crystal's own checks (a key at or above `to`, below `from`, of
+  another box) stay as a second guard; with the bounds set they never fire. Every step is counted. Each
+  open iterator is counted on the store's `StoreResources` until it is disposed, never by a finalizer
+  (`crystal.scan.open`).
 - **Writes:** write batches with a sync choice. `WriteOptions` is not disposable (freed by its finalizer), so it is
   not wrapped in `using`.
 - **Snapshots:** one per operation; disposed when the read is done.

@@ -1472,6 +1472,9 @@ internal sealed class StoreEngine : IDisposable
     /// <summary>The store's time provider (spec 004 R2.6), for replication's held-reader timing (spec 003 T7).</summary>
     internal TimeProvider Clock => _clock;
 
+    /// <summary>The native iterators open now over the store's databases (spec 012 R8), for tests.</summary>
+    internal long OpenIterators => _resources.OpenIterators;
+
     /// <summary>The store's instruments (spec 007), null until the engine is open.</summary>
     internal CrystalMetrics? Metrics => _metrics;
 
@@ -1479,7 +1482,7 @@ internal sealed class StoreEngine : IDisposable
     internal ILogger? Logger => _logger;
 
     private DatabaseContext NewDatabaseContext(RocksInstance instance, string name, uint id) =>
-        new(instance, _clock, DatabaseLabel(name, id), _options.Durability, _logger, StartSyncTimer, _metrics, _options.SlowCommitThreshold);
+        new(instance, _clock, DatabaseLabel(name, id), _options.Durability, _logger, StartSyncTimer, _metrics, _options.SlowCommitThreshold, _options.KeyLockStripes, _options.MaxKeyBytes);
 
     // ------------------------------------------------------------------ durability (spec 006)
 
@@ -1516,7 +1519,7 @@ internal sealed class StoreEngine : IDisposable
     {
         try
         {
-            _metrics = new CrystalMetrics(_options.MeterFactory, nodeId, _clock, OpenSlots, _registryDb, _options.BlockCacheBytes, _options.TagMetricsWithDatabase);
+            _metrics = new CrystalMetrics(_options.MeterFactory, nodeId, _clock, OpenSlots, _registryDb, _options.BlockCacheBytes, _options.TagMetricsWithDatabase, () => _resources.OpenIterators);
 
             // The stall check only logs (its gauge reads RocksDB when collected), so without a logger it does not run.
             if (_logger is not null)
@@ -1643,7 +1646,12 @@ internal sealed class StoreEngine : IDisposable
                         StorageGauges.Sum(instance, "rocksdb.estimate-pending-compaction-bytes"),
                         StorageGauges.SstFiles(instance),
                         StorageGauges.Sum(instance, "rocksdb.total-sst-files-size"),
-                        StorageGauges.Db(instance, "rocksdb.is-write-stopped") != 0)));
+                        StorageGauges.Db(instance, "rocksdb.is-write-stopped") != 0)
+                    {
+                        FilesPerLevel = StorageGauges.FilesPerLevel(instance),
+                        ActiveMemtableBytes = StorageGauges.Sum(instance, "rocksdb.cur-size-active-mem-table"),
+                        DelayedWriteRate = StorageGauges.Db(instance, "rocksdb.actual-delayed-write-rate"),
+                    }));
             }
         }
 

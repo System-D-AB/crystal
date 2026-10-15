@@ -38,6 +38,7 @@ version).
 ```csharp
 using System.Text;
 using SystemD.Crystal;
+using SystemD.Crystal.Encoding;
 
 // A store is one data directory holding any number of databases. One open store per directory.
 using var store = CrystalStore.Open("/var/lib/myapp");
@@ -81,6 +82,21 @@ using (var batch = shop.NewBatch())
     var current = batch.Get(orders, "counter"u8);  // a batch reads its own pending writes
     batch.Put(orders, "counter"u8, Increment(current)); // Increment: your own encoding of the counter
     batch.Commit();
+}
+
+// Newest first: a backward scan returns the range's keys in descending order.
+using (var snapshot = shop.Snapshot())
+{
+    var latest = snapshot.Scan(orders, KeyRanges.Prefix("order-"u8), limit: 10, ScanDirection.Backward).ToList();
+}
+
+// How big is a range? An estimate from RocksDB's metadata; it never scans.
+ulong bytes = shop.ApproximateBytes(orders, "order-"u8, "order."u8);
+
+// Key locks: lock one record (and the records that depend on it) without blocking a thread.
+await using (await shop.KeyLocks.LockAsync(orders, "order-1001"u8.ToArray()))
+{
+    // read, decide, write
 }
 
 // Boxes for delete-heavy key ranges (queues, moving indexes) keep scans fast as records come and go.

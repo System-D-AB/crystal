@@ -18,14 +18,17 @@ internal sealed class BoundedIterator : IDisposable
     private readonly ReadOptions _options;
     private readonly ReadOptionsPool _pool;
     private readonly int _limit;
+    private readonly StoreResources? _accounting;
     private bool _disposed;
 
-    private BoundedIterator(Iterator iterator, ReadOptions options, ReadOptionsPool pool, int limit)
+    private BoundedIterator(Iterator iterator, ReadOptions options, ReadOptionsPool pool, int limit, StoreResources? accounting)
     {
         _iterator = iterator;
         _options = options;
         _pool = pool;
         _limit = limit;
+        _accounting = accounting;
+        accounting?.IteratorOpened(); // spec 012 R8: counted until disposed, never by a finalizer
     }
 
     /// <summary>The number of native iterator steps taken so far (seek counts as one) — R6.2.</summary>
@@ -43,7 +46,8 @@ internal sealed class BoundedIterator : IDisposable
         RocksSnapshot snapshot,
         byte[] lowerBound,
         byte[] upperBound,
-        int limit)
+        int limit,
+        StoreResources? accounting = null)
     {
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(family);
@@ -58,7 +62,7 @@ internal sealed class BoundedIterator : IDisposable
 
         var options = pool.RentScan(lowerBound, upperBound, snapshot);
         var iterator = db.NewIterator(family, options);
-        return new BoundedIterator(iterator, options, pool, limit);
+        return new BoundedIterator(iterator, options, pool, limit, accounting);
     }
 
     /// <summary>
@@ -91,6 +95,52 @@ internal sealed class BoundedIterator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Yields up to the limit entries below <paramref name="upper"/> (exclusive) and at or above
+    /// <paramref name="lower"/>, in descending key order (spec 012 R1.2–R1.4). <c>SeekForPrev</c> lands on the last key
+    /// at or below its target, so a key equal to <paramref name="upper"/> is stepped over: the range never includes its
+    /// end. The lower bound on the options stops the native iterator; the check against <paramref name="lower"/> is a
+    /// second guard. Each <c>SeekForPrev</c>/<c>Prev</c> increments <see cref="Steps"/> (R1.6).
+    /// </summary>
+    /// <remarks>Ported from StowDB: src/Crystal/Crystal.Storage.RocksDb/RocksDbOrderedStore.cs (Position, Step).</remarks>
+    internal IEnumerable<(byte[] Key, byte[] Value)> ScanBackward(byte[] upper, byte[] lower)
+    {
+        ArgumentNullException.ThrowIfNull(upper);
+        ArgumentNullException.ThrowIfNull(lower);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        _iterator.SeekForPrev(upper);
+        Steps++;
+        if (_iterator.Valid() && _iterator.GetKeySpan().SequenceCompareTo(upper) >= 0)
+        {
+            _iterator.Prev(); // SeekForPrev is inclusive of its target; the range is not (R1.3)
+            Steps++;
+        }
+
+        var yielded = 0;
+        while (yielded < _limit && _iterator.Valid())
+        {
+            var keySpan = _iterator.GetKeySpan();
+            if (keySpan.SequenceCompareTo(lower) < 0)
+            {
+                break;
+            }
+
+            var key = keySpan.ToArray();
+            var value = _iterator.GetValueSpan().ToArray();
+            yield return (key, value);
+            yielded++;
+
+            if (yielded >= _limit)
+            {
+                break;
+            }
+
+            _iterator.Prev();
+            Steps++;
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -101,5 +151,6 @@ internal sealed class BoundedIterator : IDisposable
         _disposed = true;
         _iterator.Dispose();
         _pool.ReturnScan(_options);
+        _accounting?.IteratorClosed();
     }
 }

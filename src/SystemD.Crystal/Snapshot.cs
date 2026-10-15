@@ -50,9 +50,25 @@ public sealed class Snapshot : IDisposable
     /// <para>Dispose the enumeration (a <c>foreach</c> does): until it ends, a drop of this database or the store's
     /// <c>Dispose</c> waits for it, and calling either from inside the loop waits forever (spec 005 design A3, A9).</para>
     /// </summary>
-    public IEnumerable<KeyValue> Scan(Box box, ReadOnlySpan<byte> from, ReadOnlySpan<byte> to, int limit)
+    public IEnumerable<KeyValue> Scan(Box box, ReadOnlySpan<byte> from, ReadOnlySpan<byte> to, int limit) =>
+        Scan(box, from, to, limit, ScanDirection.Forward);
+
+    /// <summary>
+    /// Scans <c>[from, to)</c> within <paramref name="box"/> at this snapshot in the given
+    /// <paramref name="direction"/> (spec 012 R1). <see cref="ScanDirection.Backward"/> returns the keys the forward
+    /// scan of the range would, in descending order: from the greatest key strictly below <paramref name="to"/> (a key
+    /// equal to it is never returned) down to <paramref name="from"/>. Empty bounds are the box's start and end, and the
+    /// limit counts from the first key returned. Never returns keys of another box.
+    /// <para>Dispose the enumeration (a <c>foreach</c> does), as for the forward scan.</para>
+    /// </summary>
+    public IEnumerable<KeyValue> Scan(Box box, ReadOnlySpan<byte> from, ReadOnlySpan<byte> to, int limit, ScanDirection direction)
     {
         ThrowIfDisposed();
+        if (!Enum.IsDefined(direction))
+        {
+            throw new ArgumentOutOfRangeException(nameof(direction), direction, "Not a scan direction.");
+        }
+
         IEnumerable<KeyValue> scan;
         using (_database.EnterOperation())
         {
@@ -62,11 +78,15 @@ public sealed class Snapshot : IDisposable
                 return [];
             }
 
-            scan = _context.ScanBox(box.Id, _storageSnapshot, from, to, limit);
+            scan = _context.ScanBox(box.Id, _storageSnapshot, from, to, limit, direction);
         }
 
         return Enumerate(scan);
     }
+
+    /// <summary>Scans <paramref name="range"/> within <paramref name="box"/> at this snapshot (spec 012 R4.1).</summary>
+    public IEnumerable<KeyValue> Scan(Box box, KeyRange range, int limit, ScanDirection direction = ScanDirection.Forward) =>
+        Scan(box, range.From ?? [], range.To ?? [], limit, direction);
 
     private IEnumerable<KeyValue> Enumerate(IEnumerable<KeyValue> scan)
     {

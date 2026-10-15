@@ -27,6 +27,7 @@ public sealed class Batch : IDisposable
     private readonly Dictionary<uint, Dictionary<byte[], byte[]?>> _pendingPoints = [];
     private readonly Dictionary<uint, List<(byte[] From, byte[] To)>> _pendingRanges = [];
 
+    private long _bytes; // spec 012 R5.2: key, value and range-end bytes the product passed, prefix excluded
     private int _disposed;
 
     internal Batch(CrystalDatabase database, DatabaseContext context)
@@ -35,15 +36,27 @@ public sealed class Batch : IDisposable
         _context = context ?? throw new ArgumentNullException(nameof(context));
     }
 
+    /// <summary>The number of operations staged: puts, deletes and range deletes (spec 012 R5.1). Zero after a commit or dispose.</summary>
+    public int Count => _operations.Count;
+
+    /// <summary>
+    /// The bytes staged: the sum of the keys, values and range ends the product passed, without Crystal's box prefix
+    /// (spec 012 R5.2). Zero after a commit or dispose. A product loading in pages bounds its batches by this.
+    /// </summary>
+    public long Bytes => _bytes;
+
     /// <summary>
     /// Enqueues putting <paramref name="value"/> under <paramref name="key"/> in <paramref name="box"/> (spec 002 R6.1).
     /// </summary>
+    /// <exception cref="KeyTooLargeException">The key is longer than <see cref="CrystalOptions.MaxKeyBytes"/>.</exception>
     public void Put(Box box, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         ThrowIfDisposed();
         using var _ = _database.EnterOperation();
         _context.EnsureOwned(box);
+        _context.EnsureKeySize(box, key.Length);
         TrackBox(box.Id);
+        _bytes += key.Length + value.Length;
 
         var keyBytes = key.ToArray();
         var valBytes = value.ToArray();
@@ -60,12 +73,15 @@ public sealed class Batch : IDisposable
     /// <summary>
     /// Enqueues deleting <paramref name="key"/> in <paramref name="box"/> (spec 002 R6.1).
     /// </summary>
+    /// <exception cref="KeyTooLargeException">The key is longer than <see cref="CrystalOptions.MaxKeyBytes"/>.</exception>
     public void Delete(Box box, ReadOnlySpan<byte> key)
     {
         ThrowIfDisposed();
         using var _ = _database.EnterOperation();
         _context.EnsureOwned(box);
+        _context.EnsureKeySize(box, key.Length);
         TrackBox(box.Id);
+        _bytes += key.Length;
 
         var keyBytes = key.ToArray();
         var prefixedKey = BoxKeys.BuildKey(box.Id, key);
@@ -93,7 +109,10 @@ public sealed class Batch : IDisposable
             throw new ArgumentException("The range's start sorts after its end (R6.1).", nameof(from));
         }
 
+        _context.EnsureKeySize(box, from.Length);
+        _context.EnsureKeySize(box, to.Length);
         TrackBox(box.Id);
+        _bytes += from.Length + to.Length;
 
         var fromBytes = from.ToArray();
         var toBytes = to.ToArray();
@@ -159,6 +178,12 @@ public sealed class Batch : IDisposable
         var prefixedKey = BoxKeys.BuildKey(box.Id, key);
         return _context.DirectGet(family, prefixedKey);
     }
+
+    /// <summary>Enqueues deleting every key of <paramref name="range"/> in <paramref name="box"/> (spec 012 R4.1).</summary>
+    public void DeleteRange(Box box, KeyRange range) => DeleteRange(box, range.From ?? [], range.To ?? []);
+
+    /// <summary>Scans <paramref name="range"/> within <paramref name="box"/>, seeing this batch's pending writes (spec 012 R4.1).</summary>
+    public IEnumerable<KeyValue> Scan(Box box, KeyRange range, int limit) => Scan(box, range.From ?? [], range.To ?? [], limit);
 
     /// <summary>
     /// Scans a range of keys within <paramref name="box"/>, seeing this batch's pending writes (spec 002 R6.2, R6.5).
@@ -336,6 +361,7 @@ public sealed class Batch : IDisposable
 
         _context.CommitBatch(_touchedBoxes, _operations, durability);
 
+        _bytes = 0;
         _operations.Clear();
         _touchedBoxes.Clear();
         _touchedBoxSet.Clear();
@@ -389,6 +415,7 @@ public sealed class Batch : IDisposable
             return;
         }
 
+        _bytes = 0;
         _operations.Clear();
         _touchedBoxes.Clear();
         _touchedBoxSet.Clear();

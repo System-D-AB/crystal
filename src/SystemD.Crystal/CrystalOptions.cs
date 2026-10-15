@@ -16,6 +16,19 @@ public sealed class CrystalOptions
     /// <summary>The maximum number of simultaneously open databases (default 256).</summary>
     public int MaxOpenDatabases { get; init; } = 256;
 
+    /// <summary>
+    /// The number of stripes of each database's <see cref="KeyLocks"/> (spec 012 R3.7; default 256, at least 1), fixed
+    /// for the store's lifetime. More stripes mean fewer unrelated keys serialised on one stripe.
+    /// </summary>
+    public int KeyLockStripes { get; init; } = 256;
+
+    /// <summary>
+    /// The longest key, in bytes, a batch stages in a box (spec 012 R9; default null, no limit; when set, from 1 to
+    /// 1 MiB). A longer key is refused with <see cref="KeyTooLargeException"/> when it is staged. The box prefix is not
+    /// counted; reads are not checked; a standby applies whatever its primary committed.
+    /// </summary>
+    public int? MaxKeyBytes { get; init; }
+
     /// <summary>The number of background threads for compaction and flushing (default 2).</summary>
     public int BackgroundThreads { get; init; } = 2;
 

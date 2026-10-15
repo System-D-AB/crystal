@@ -55,6 +55,7 @@ internal sealed class CrystalMetrics : IDisposable
     /// <param name="registry">The registry instance: always open, and sharing the block cache with every database.</param>
     /// <param name="blockCacheCapacity">The shared block cache's size.</param>
     /// <param name="tagDatabase">Report gauges per database, tagged with its name (R1.3).</param>
+    /// <param name="openIterators">The store's open native iterators (spec 012 R8), or null.</param>
     public CrystalMetrics(
         IMeterFactory? factory,
         string nodeId,
@@ -62,7 +63,8 @@ internal sealed class CrystalMetrics : IDisposable
         Func<DatabaseSlot[]> openSlots,
         RocksInstance registry,
         long blockCacheCapacity,
-        bool tagDatabase)
+        bool tagDatabase,
+        Func<long>? openIterators = null)
     {
         // One meter per store (spec 007 review, finding 2). A factory caches meters by name, version, tags and scope, so
         // the store itself is the scope: two stores never share a meter or its instruments, and the store disposes its
@@ -93,7 +95,7 @@ internal sealed class CrystalMetrics : IDisposable
         _syncFailures = _meter.CreateCounter<long>("crystal.wal.sync.failures", "{failure}",
             "Writes or WAL syncs that failed, each failing its database (spec 006 R5), tagged by reason.");
         _lockWait = _meter.CreateHistogram<double>("crystal.lock.wait.duration", "s",
-            "Time a box lock waited for a stripe someone else held. Uncontended locks are not recorded.");
+            "Time a box or key lock waited for a stripe someone else held, tagged crystal.lock.scope. Uncontended locks are not recorded.");
         _lockAll = _meter.CreateCounter<long>("crystal.lock.all.count", "{lock}",
             "LockAll calls: a product re-planning under a moving lock set shows here.");
         _scanSteps = _meter.CreateHistogram<long>("crystal.scan.steps", "{step}",
@@ -135,6 +137,8 @@ internal sealed class CrystalMetrics : IDisposable
             () => Single(blockCacheCapacity), "By", "Size of the store's shared block cache.");
 
         _meter.CreateObservableGauge("crystal.store.databases.open", () => Single(_openSlots().Length), "{database}", "Open databases.");
+        _meter.CreateObservableGauge("crystal.scan.open", () => Single(openIterators?.Invoke() ?? 0), "{iterator}",
+            "Native iterators open now, store-wide: a scan not disposed stays counted (spec 012 R8).");
         _meter.CreateObservableGauge("crystal.store.boxes", () => Sum(_ => 0, s => s.Context.LiveBoxCount), "{box}", "Live boxes in open databases.");
         _meter.CreateObservableGauge("crystal.store.databases.failed",
             () => Sum(_ => 0, s => s.Context.Failed ? 1 : 0), "{database}", "Open databases that have failed (spec 006 R5).");
@@ -175,7 +179,14 @@ internal sealed class CrystalMetrics : IDisposable
 
     public void WalSyncFailed(string reason) => _syncFailures.Add(1, new KeyValuePair<string, object?>("reason", reason));
 
-    public void LockWait(long start) => _lockWait.Record(_clock.GetElapsedTime(start).TotalSeconds);
+    /// <summary>The <c>crystal.lock.scope</c> tag of a box lock's wait (spec 012 R3.8).</summary>
+    public static readonly KeyValuePair<string, object?> BoxScope = new("crystal.lock.scope", "box");
+
+    /// <summary>The <c>crystal.lock.scope</c> tag of a key lock's wait (spec 012 R3.8).</summary>
+    public static readonly KeyValuePair<string, object?> KeyScope = new("crystal.lock.scope", "key");
+
+    public void LockWait(long start, KeyValuePair<string, object?> scope) =>
+        _lockWait.Record(_clock.GetElapsedTime(start).TotalSeconds, scope);
 
     public void LockAll() => _lockAll.Add(1);
 

@@ -198,6 +198,30 @@ public sealed class ReferenceModelTests : IDisposable
                             Assert.Equal(expectedRows[i].Key, actualRows[i].Key);
                             Assert.Equal(expectedRows[i].Value, actualRows[i].Value);
                         }
+
+                        // Spec 012 R1.7: a backward scan of a random range agrees with the model, reversed.
+                        // Bounds from the model's key space: empty, an existing key (k_0..k_19), or a key and 0x00
+                        // just above it, so `to` lands exactly on a key, between keys, and at the box's end.
+                        byte[] Bound()
+                        {
+                            var choice = random.Next(4);
+                            var key = Text.UTF8.GetBytes($"k_{random.Next(20)}");
+                            return choice switch { 0 => [], 1 => key, _ => [.. key, 0x00] };
+                        }
+
+                        var from = Bound();
+                        var to = Bound();
+                        if (from.Length > 0 && to.Length > 0 && from.AsSpan().SequenceCompareTo(to) > 0)
+                        {
+                            (from, to) = (to, from);
+                        }
+
+                        var backLimit = random.Next(1, 30);
+                        var actualBack = snap.Scan(handles[b.Id], from, to, backLimit, ScanDirection.Backward).ToList();
+                        var expectedBack = model.Scan(b.Id, from, to, int.MaxValue);
+                        expectedBack.Reverse();
+                        Assert.Equal(expectedBack.Take(backLimit).Select(r => Convert.ToHexString(r.Key) + "=" + Convert.ToHexString(r.Value)),
+                            actualBack.Select(r => Convert.ToHexString(r.Key) + "=" + Convert.ToHexString(r.Value)));
                     }
                     break;
                 }
@@ -258,6 +282,8 @@ public sealed class ReferenceModelTests : IDisposable
                 }
             }
         }
+
+        Assert.Equal(0, store.Engine.OpenIterators); // spec 012 R8.3: every scan of the run was disposed
     }
 
     // ---------------------------------------------------------------------------------------------

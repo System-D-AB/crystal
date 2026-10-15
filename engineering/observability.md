@@ -34,9 +34,10 @@ var store = CrystalStore.Open(path, new CrystalOptions
 | `crystal.wal.sync.count` | counter, `{sync}` | `reason` (interval, sync_all, close) | WAL syncs outside a strict commit; a strict commit's sync is in its commit. |
 | `crystal.wal.sync.duration` | histogram, `s` | `reason` | One WAL sync. |
 | `crystal.wal.sync.failures` | counter, `{failure}` | `reason` (commit, catalogue, interval, sync_all, close) | Writes or syncs that failed their database, each counted once. **Alert on any.** |
-| `crystal.lock.wait.duration` | histogram, `s` | — | Time a box lock waited for a stripe someone held. Uncontended locks are not recorded. |
+| `crystal.lock.wait.duration` | histogram, `s` | `crystal.lock.scope` (box, key) | Time a box or key lock waited for a stripe someone held. Uncontended locks are not recorded. |
 | `crystal.lock.all.count` | counter, `{lock}` | — | `LockAll` calls. |
-| `crystal.scan.steps` | histogram, `{step}` | — | Native iterator steps per scan. Steps growing while results do not: tombstones at the head of a range. |
+| `crystal.scan.steps` | histogram, `{step}` | — | Native iterator steps per scan, forward or backward. Steps growing while results do not: tombstones at the head of a range. |
+| `crystal.scan.open` | gauge, `{iterator}` | — | Native iterators open now, store-wide. Counted closed only when disposed, so a scan nobody disposed stays visible. **Alert when it only grows.** |
 | `crystal.storage.memtable.deletes` | gauge, `{deletion}` | `database`* | Deletions in memtables, not yet flushed. |
 | `crystal.storage.keys.estimated` | gauge, `{key}` | `database`* | RocksDB's estimate of live keys. |
 | `crystal.storage.live_data.size` | gauge, `By` | `database`* | RocksDB's estimate of live data. |
@@ -124,7 +125,8 @@ listener endpoint and a bounded log of recent transitions; the protocol's `STATU
 `CrystalStore.Status()` returns one consistent snapshot for a product's status or health endpoint: node id, format,
 durability and interval, the shared cache, and per open database its id, name, box count, failed state and cause, last
 successful WAL sync, and RocksDB's view (memtable deletes, keys, live data, pending compaction, SST files and size,
-write stopped). It reads memory and properties only; a database closing meanwhile is left out. While a backup runs,
+write stopped, and from `012` its files per level, active memtable bytes and delayed write rate). It reads memory
+and properties only; a database closing meanwhile is left out. While a backup runs,
 `Backup` names its root, the databases done and to do, and the bytes copied so far (spec 010 R7.3); it is null
 otherwise.
 

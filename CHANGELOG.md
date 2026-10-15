@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+Spec `012` (product adoption primitives), the parts that add to the API without changing the architecture. No
+format, catalogue, encoder or protocol change: stores written by 1.0.0-preview.1 open unchanged.
+
+- **Backward scans** on snapshots (`ScanDirection.Backward`).
+- **Range size estimates:** `CrystalDatabase.ApproximateBytes`, one range or several in one native call.
+- **Key locks** (`CrystalDatabase.KeyLocks`, `CrystalOptions.KeyLockStripes`), sync and async, and **async box locks**
+  (`BoxLocks.LockAsync`, `LockManyAsync`); both return a `LockLease`.
+- **Key ranges:** `KeyRange`, `KeyBound`, and the `KeyRanges` builders, with overloads of scans and range deletes.
+- **Batch accounting:** `Batch.Count`, `Batch.Bytes`.
+- **`KeyReader`**, the reading half of `KeyWriter`.
+- **A key size limit** (`CrystalOptions.MaxKeyBytes`, `KeyTooLargeException`), off by default.
+- **Observability:** the `crystal.scan.open` gauge, a `crystal.lock.scope` tag on lock waits, and more storage status
+  (files per level, active memtable bytes, delayed write rate).
+
 ## 1.0.0-preview.1
 
 The first 1.0 preview: the complete storage kernel. The public API may still change before 1.0 as the first products

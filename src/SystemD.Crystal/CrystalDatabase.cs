@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using SystemD.Crystal.Storage;
 
@@ -44,6 +46,12 @@ public sealed class CrystalDatabase
     /// <summary>Per-box striped locks for product read-decide-write sequences (spec 002 R5; design § 4).</summary>
     public BoxLocks Locks => _slot.Context.Locks;
 
+    /// <summary>
+    /// Per-key striped locks (spec 012 R3), for a read-decide-write on one record and the records that depend on it.
+    /// Independent of <see cref="Locks"/>: a box lock does not exclude key locks in that box.
+    /// </summary>
+    public KeyLocks KeyLocks => _slot.Context.KeyLocks;
+
     /// <summary>Creates a new batch for writes across boxes in this database (spec 002 R6; design § 2).</summary>
     public Batch NewBatch()
     {
@@ -56,6 +64,41 @@ public sealed class CrystalDatabase
     /// it when done; a snapshot still held when the database is dropped or the store closes is released then.
     /// </summary>
     public Snapshot Snapshot() => new(this, _slot.Context, _slot);
+
+    /// <summary>
+    /// RocksDB's estimate of the bytes the keys of <paramref name="box"/> in <c>[from, to)</c> occupy, memtables and
+    /// table files included (spec 012 R2). Empty bounds are the box's start and end, so the whole box is a valid range;
+    /// <paramref name="from"/> after <paramref name="to"/> is refused with <see cref="ArgumentException"/>, and equal
+    /// bounds give 0.
+    /// <para><b>An estimate, not a count:</b> approximate, not consistent with any snapshot, and <b>0 does not mean
+    /// empty</b> (a small range, or one held only in memory, can be below the estimate's resolution). Turning bytes into
+    /// a number of entries belongs to the product, which knows its entries' widths. It never scans: its cost does not
+    /// grow with the range. A read: allowed on a standby and on a failed database.</para>
+    /// </summary>
+    public ulong ApproximateBytes(Box box, ReadOnlySpan<byte> from, ReadOnlySpan<byte> to)
+    {
+        if (!from.IsEmpty && !to.IsEmpty && from.SequenceCompareTo(to) > 0)
+        {
+            throw new ArgumentException("The range's start sorts after its end (spec 012 R2.4).", nameof(from));
+        }
+
+        return ApproximateBytes(box, [new KeyRange(from.ToArray(), to.ToArray())])[0];
+    }
+
+    /// <summary>Estimates one <see cref="KeyRange"/> of <paramref name="box"/> (spec 012 R2, R4.1).</summary>
+    public ulong ApproximateBytes(Box box, KeyRange range) => ApproximateBytes(box, [range])[0];
+
+    /// <summary>
+    /// Estimates several ranges of one box in one native call (spec 012 R2.3): one value per range, in order. See
+    /// <see cref="ApproximateBytes(Box, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/> for what the numbers mean.
+    /// </summary>
+    public ulong[] ApproximateBytes(Box box, IReadOnlyList<KeyRange> ranges)
+    {
+        ArgumentNullException.ThrowIfNull(ranges);
+        using var _ = EnterOperation();
+        _slot.Context.EnsureOwned(box);
+        return _slot.Context.ApproximateBytes(box.Id, [.. ranges.Select(r => (r.From ?? [], r.To ?? []))]);
+    }
 
     /// <summary>
     /// Enters one call through this database, lock-free (spec 005 design addendum A3). Refused with

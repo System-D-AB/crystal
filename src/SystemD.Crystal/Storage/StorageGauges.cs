@@ -66,6 +66,18 @@ internal readonly record struct StorageGauges(
         return total;
     }
 
+    /// <summary>SST files at each level 0–6, summed over the column families (spec 012 R11).</summary>
+    internal static long[] FilesPerLevel(RocksInstance instance)
+    {
+        var levels = new long[7];
+        for (var level = 0; level < levels.Length; level++)
+        {
+            levels[level] = Sum(instance, NumFilesAtLevelPrefix + level.ToString(CultureInfo.InvariantCulture));
+        }
+
+        return levels;
+    }
+
     /// <summary>A database-wide property (stalls, the shared cache), read once, 0 if unknown (R6.3).</summary>
     internal static long Db(RocksInstance instance, string property)
     {

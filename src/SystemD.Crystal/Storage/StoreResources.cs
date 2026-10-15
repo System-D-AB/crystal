@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using RocksDbSharp;
 
 namespace SystemD.Crystal.Storage;
@@ -13,6 +14,18 @@ internal sealed class StoreResources : IDisposable
 {
     private IntPtr _writeBufferManager;
     private bool _disposed;
+    private long _openIterators;
+
+    /// <summary>
+    /// The native iterators open now over every database of the store (spec 012 R8). Counted closed only when disposed,
+    /// never by a finalizer, so a scan nobody disposed stays visible.
+    /// </summary>
+    /// <remarks>Ported from StowDB: src/Crystal/Crystal.Storage.RocksDb/IteratorAccounting.cs (the open count).</remarks>
+    internal long OpenIterators => Interlocked.Read(ref _openIterators);
+
+    internal void IteratorOpened() => Interlocked.Increment(ref _openIterators);
+
+    internal void IteratorClosed() => Interlocked.Decrement(ref _openIterators);
 
     private StoreResources(Cache blockCache, Env environment, IntPtr writeBufferManager)
     {

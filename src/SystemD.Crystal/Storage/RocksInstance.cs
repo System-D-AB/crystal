@@ -42,10 +42,13 @@ internal sealed class RocksInstance : IDisposable
     private readonly object _syncLock = new();
     private bool _disposed;
 
-    private RocksInstance(RocksDb db, Dictionary<string, ColumnFamilyHandle> families)
+    private readonly StoreResources _resources;
+
+    private RocksInstance(RocksDb db, Dictionary<string, ColumnFamilyHandle> families, StoreResources resources)
     {
         _db = db;
         _families = families;
+        _resources = resources;
         ReadOptions = new ReadOptionsPool();
     }
 
@@ -99,7 +102,7 @@ internal sealed class RocksInstance : IDisposable
             handles[name] = db.GetColumnFamily(name);
         }
 
-        return new RocksInstance(db, handles);
+        return new RocksInstance(db, handles, resources);
     }
 
     /// <summary>
@@ -127,7 +130,7 @@ internal sealed class RocksInstance : IDisposable
             handles[name] = db.GetColumnFamily(name);
         }
 
-        return new RocksInstance(db, handles);
+        return new RocksInstance(db, handles, resources);
     }
 
     private static BoxProfile ProfileOf(string family, IReadOnlyDictionary<string, BoxProfile> profiles) =>
@@ -317,7 +320,7 @@ internal sealed class RocksInstance : IDisposable
 
     /// <summary>Opens a bounded, limited, snapshot-pinned forward scan of a key range (R3.2, R4.4).</summary>
     internal BoundedIterator Scan(string family, RocksSnapshot snapshot, byte[] lowerBound, byte[] upperBound, int limit) =>
-        BoundedIterator.Open(_db, Family(family), ReadOptions, snapshot, lowerBound, upperBound, limit);
+        BoundedIterator.Open(_db, Family(family), ReadOptions, snapshot, lowerBound, upperBound, limit, _resources);
 
     public void Dispose()
     {

@@ -352,3 +352,28 @@ public sealed class DatabaseUidTakenException : Exception
         ExistingName = existingName;
     }
 }
+
+/// <summary>
+/// Thrown when a batch stages a key longer than <see cref="CrystalOptions.MaxKeyBytes"/> (spec 012 R9). Nothing of the
+/// operation is staged.
+/// </summary>
+public sealed class KeyTooLargeException : Exception
+{
+    /// <summary>The name of the box the key was for.</summary>
+    public string BoxName { get; }
+
+    /// <summary>The key's length in bytes.</summary>
+    public int KeyBytes { get; }
+
+    /// <summary>The limit it exceeded.</summary>
+    public int Limit { get; }
+
+    /// <summary>Initializes a new instance of <see cref="KeyTooLargeException"/>.</summary>
+    public KeyTooLargeException(string boxName, int keyBytes, int limit, string message)
+        : base(message)
+    {
+        BoxName = boxName;
+        KeyBytes = keyBytes;
+        Limit = limit;
+    }
+}

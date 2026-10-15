@@ -73,6 +73,8 @@ internal sealed class DatabaseContext : IDisposable
     /// timer runs (spec 006 R4.1).</param>
     /// <param name="metrics">The store's instruments (spec 007), or null for the registry.</param>
     /// <param name="slowCommitThreshold">Log a commit slower than this (spec 007 R3.3); null never.</param>
+    /// <param name="keyLockStripes">The stripes of the key locks (spec 012 R3.7).</param>
+    /// <param name="maxKeyBytes">The longest key a batch stages (spec 012 R9); null for no limit.</param>
     internal DatabaseContext(
         RocksInstance db,
         TimeProvider clock,
@@ -81,8 +83,11 @@ internal sealed class DatabaseContext : IDisposable
         ILogger? logger = null,
         Action? onIntervalWrite = null,
         CrystalMetrics? metrics = null,
-        TimeSpan? slowCommitThreshold = null)
+        TimeSpan? slowCommitThreshold = null,
+        int keyLockStripes = 256,
+        int? maxKeyBytes = null)
     {
+        _maxKeyBytes = maxKeyBytes;
         _db = db;
         _clock = clock;
         _label = label;
@@ -92,7 +97,31 @@ internal sealed class DatabaseContext : IDisposable
         _metrics = metrics;
         _slowCommitThreshold = slowCommitThreshold;
         _locks = new BoxLocks(metrics);
+        _keyLocks = new KeyLocks(keyLockStripes, EnsureOwned, metrics);
     }
+
+    private readonly KeyLocks _keyLocks;
+    private readonly int? _maxKeyBytes;
+
+    /// <summary>
+    /// Refuses a key (or range end) longer than <see cref="CrystalOptions.MaxKeyBytes"/>, when it is staged (spec 012
+    /// R9.1). The box prefix is not counted. Reads are never checked (R9.2), nor is a standby's apply.
+    /// </summary>
+    public void EnsureKeySize(Box box, int keyBytes)
+    {
+        if (_maxKeyBytes is { } limit && keyBytes > limit)
+        {
+            throw new KeyTooLargeException(
+                box.Name,
+                keyBytes,
+                limit,
+                $"A key of {keyBytes} bytes in box '{box.Name}' is longer than the {limit} bytes CrystalOptions.MaxKeyBytes " +
+                "allows (spec 012 R9). Shorten the key, or hash its tail and keep the full value in the record.");
+        }
+    }
+
+    /// <summary>Key locks (spec 012 R3), independent of the box locks.</summary>
+    public KeyLocks KeyLocks => _keyLocks;
 
     private readonly CrystalMetrics? _metrics;
     private readonly TimeSpan? _slowCommitThreshold;
@@ -1184,12 +1213,85 @@ internal sealed class DatabaseContext : IDisposable
 
     public StorageSnapshot CreateSnapshot() => new(_db.CreateSnapshot());
 
+    /// <summary>
+    /// RocksDB's estimate of the bytes each of <paramref name="ranges"/> of box <paramref name="boxId"/> occupies,
+    /// memtables and table files included (spec 012 R2). Never scans. Empty bounds are the box's start and end; a
+    /// range whose start sorts after its end is refused, an empty range is 0 without a native call.
+    /// </summary>
+    public ulong[] ApproximateBytes(uint boxId, IReadOnlyList<(byte[] From, byte[] To)> ranges)
+    {
+        ArgumentNullException.ThrowIfNull(ranges);
+        string family;
+        _catalogueGate.EnterReadLock();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_records.TryGetValue(boxId, out var record) || record.State != LiveState)
+            {
+                var name = record?.Name ?? boxId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                throw new BoxDroppedException(boxId, name, $"Box '{name}' (id {boxId}) has been dropped (R4.1).");
+            }
+
+            family = FamilyOf(record);
+        }
+        finally
+        {
+            _catalogueGate.ExitReadLock();
+        }
+
+        BoxKeys.GetBoxBounds(boxId, out var boxLower, out var boxUpper);
+        var results = new ulong[ranges.Count];
+        var native = new List<(byte[] From, byte[] To)>(ranges.Count);
+        var positions = new List<int>(ranges.Count);
+        for (var i = 0; i < ranges.Count; i++)
+        {
+            var (from, to) = ranges[i];
+            ArgumentNullException.ThrowIfNull(from, nameof(ranges));
+            ArgumentNullException.ThrowIfNull(to, nameof(ranges));
+            if (from.Length > 0 && to.Length > 0)
+            {
+                var order = from.AsSpan().SequenceCompareTo(to);
+                if (order > 0)
+                {
+                    throw new ArgumentException($"Range {i} starts after it ends (R2.4).", nameof(ranges));
+                }
+
+                if (order == 0)
+                {
+                    continue; // empty: 0, no native call
+                }
+            }
+
+            native.Add((from.Length == 0 ? boxLower : BoxKeys.BuildKey(boxId, from), to.Length == 0 ? boxUpper : BoxKeys.BuildKey(boxId, to)));
+            positions.Add(i);
+        }
+
+        if (native.Count > 0)
+        {
+            var sizes = NativeRocks.ApproximateSizes(_db.Db, _db.Family(family), System.Runtime.InteropServices.CollectionsMarshal.AsSpan(native));
+            for (var j = 0; j < positions.Count; j++)
+            {
+                results[positions[j]] = sizes[j];
+            }
+        }
+
+        return results;
+    }
+
     public IEnumerable<KeyValue> ScanBox(
         uint boxId,
         StorageSnapshot snapshot,
         ReadOnlySpan<byte> from,
         ReadOnlySpan<byte> to,
-        int limit)
+        int limit) => ScanBox(boxId, snapshot, from, to, limit, ScanDirection.Forward);
+
+    public IEnumerable<KeyValue> ScanBox(
+        uint boxId,
+        StorageSnapshot snapshot,
+        ReadOnlySpan<byte> from,
+        ReadOnlySpan<byte> to,
+        int limit,
+        ScanDirection direction)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
 
@@ -1216,7 +1318,7 @@ internal sealed class DatabaseContext : IDisposable
         var lowerBound = from.IsEmpty ? boxLower : BoxKeys.BuildKey(boxId, from);
         var upperBound = to.IsEmpty ? boxUpper : BoxKeys.BuildKey(boxId, to);
 
-        return ScanBoxCore(boxId, family, snapshot, lowerBound, upperBound, limit);
+        return ScanBoxCore(boxId, family, snapshot, lowerBound, upperBound, limit, direction);
     }
 
     private IEnumerable<KeyValue> ScanBoxCore(
@@ -1225,12 +1327,16 @@ internal sealed class DatabaseContext : IDisposable
         StorageSnapshot snapshot,
         byte[] lowerBound,
         byte[] upperBound,
-        int limit)
+        int limit,
+        ScanDirection direction)
     {
         using var iterator = _db.Scan(family, snapshot.Value, lowerBound, upperBound, limit);
         try
         {
-            foreach (var (k, v) in iterator.Scan(lowerBound))
+            var entries = direction == ScanDirection.Backward
+                ? iterator.ScanBackward(upperBound, lowerBound)
+                : iterator.Scan(lowerBound);
+            foreach (var (k, v) in entries)
             {
                 // Verify key is inside this box
                 if (BoxKeys.ExtractBoxId(k) != boxId)
