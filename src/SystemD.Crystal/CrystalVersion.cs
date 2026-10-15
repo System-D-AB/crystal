@@ -6,5 +6,5 @@ namespace SystemD.Crystal;
 public static class CrystalVersion
 {
     /// <summary>The informational version string of this build.</summary>
-    public const string Value = "1.0.0-preview.1";
+    public const string Value = "1.0.0-rc.1";
 }

@@ -19,6 +19,7 @@ internal sealed class DatabaseSlot
     private const int Open = 0;
     private const int Dropped = 1;
     private const int StoreClosed = 2;
+    private const int Replaced = 3; // re-created under the same UID by a standby's snapshot install (spec 013 R7)
 
     private static readonly TimeSpan WaitWarningInterval = TimeSpan.FromSeconds(10);
 
@@ -66,8 +67,9 @@ internal sealed class DatabaseSlot
     public CrystalDatabase Handle { get; set; } = null!;
 
     /// <summary>
-    /// Enters one call. Refused with <see cref="DatabaseNotFoundException"/> once the database is dropped, or with
-    /// <see cref="ObjectDisposedException"/> once the store is closing (R5.7).
+    /// Enters one call. Refused with <see cref="DatabaseNotFoundException"/> once the database is dropped or replaced
+    /// (a standby re-installed it from a snapshot), or with <see cref="ObjectDisposedException"/> once the store is
+    /// closing (R5.7; spec 013 R7). A store that is still open never reports itself closed.
     /// </summary>
     public IDisposable Enter(string name)
     {
@@ -76,12 +78,19 @@ internal sealed class DatabaseSlot
         if (closing != Open)
         {
             Exit();
-            throw closing == Dropped
-                ? new DatabaseNotFoundException(
+            throw closing switch
+            {
+                Dropped => new DatabaseNotFoundException(
                     name,
                     $"Database '{name}' (id {Id}) has been dropped. A handle is never redirected to a database created " +
-                    "later under the same name (R5.7); open that one by name.")
-                : new ObjectDisposedException(nameof(CrystalStore), $"The store holding database '{name}' has been closed.");
+                    "later under the same name (R5.7); open that one by name."),
+                Replaced => new DatabaseNotFoundException(
+                    name,
+                    $"Database '{name}' (id {Id}) was re-created from its primary's snapshot (a re-bootstrap on this standby), " +
+                    "so this handle and its box handles no longer address it. The store is open: open the database by " +
+                    "name again for its new handle."),
+                _ => new ObjectDisposedException(nameof(CrystalStore), $"The store holding database '{name}' has been closed."),
+            };
         }
 
         return new Scope(this);
@@ -161,6 +170,13 @@ internal sealed class DatabaseSlot
     /// <summary>Marks the slot closing; from here every new call is refused. Returns false if it already was.</summary>
     public bool BeginClose(bool dropped) =>
         Interlocked.CompareExchange(ref _closing, dropped ? Dropped : StoreClosed, Open) == Open;
+
+    /// <summary>
+    /// Marks the slot closing because its database is being re-created in place (a standby's snapshot install, spec 013
+    /// R7): every new call through the old handle is refused with <see cref="DatabaseNotFoundException"/>, saying to
+    /// open the database again. Returns false if it was already closing.
+    /// </summary>
+    public bool BeginReplace() => Interlocked.CompareExchange(ref _closing, Replaced, Open) == Open;
 
     /// <summary>Waits until no call is in progress. Call after <see cref="BeginClose"/>.</summary>
     public void WaitForCallsInProgress(ILogger? logger)

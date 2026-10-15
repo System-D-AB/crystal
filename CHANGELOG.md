@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.1
 
-Spec `012` (product adoption primitives), the parts that add to the API without changing the architecture. No
-format, catalogue, encoder or protocol change: stores written by 1.0.0-preview.1 open unchanged.
+The first 1.0 release candidate. Every addition is to the API; nothing was removed or renamed. No format,
+catalogue, encoder or protocol change: stores written by 1.0.0-preview.1 open unchanged. Tested on Windows and Linux.
 
 - **Backward scans** on snapshots (`ScanDirection.Backward`).
 - **Range size estimates:** `CrystalDatabase.ApproximateBytes`, one range or several in one native call.
@@ -15,6 +15,9 @@ format, catalogue, encoder or protocol change: stores written by 1.0.0-preview.1
 - **A key size limit** (`CrystalOptions.MaxKeyBytes`, `KeyTooLargeException`), off by default.
 - **Observability:** the `crystal.scan.open` gauge, a `crystal.lock.scope` tag on lock waits, and more storage status
   (files per level, active memtable bytes, delayed write rate).
+- **Fixed: a replaced database's handle no longer says the store closed.** When a standby re-creates a database from
+  its primary's snapshot, the old `CrystalDatabase` handle (and its boxes) now throw `DatabaseNotFoundException`
+  saying to open the database again by name; `ObjectDisposedException` means only that the store itself was closed.
 
 ## 1.0.0-preview.1
 

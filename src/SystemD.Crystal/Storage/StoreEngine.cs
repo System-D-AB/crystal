@@ -690,7 +690,7 @@ internal sealed class StoreEngine : IDisposable
                 open = slot;
                 _open.Remove(eid);
                 PublishOpenSlots();
-                slot.BeginClose(dropped: false);
+                slot.BeginReplace(); // its handles say "re-created, open again", never "store closed" (spec 013 R7)
                 slot.StopRunningBackup(); // a backup copying it is stopped, not waited for; it tries again (spec 010 review S1)
             }
 

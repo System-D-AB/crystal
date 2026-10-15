@@ -20,14 +20,12 @@ Crystal is a kernel, not a database server. It has no query language, documents,
 failover policy: the product built on top decides those. See [`product/intro.md`](product/intro.md) for what Crystal is
 and is not, and [`engineering/box-layout.md`](engineering/box-layout.md) for how the bytes are laid out.
 
-> **Status: `1.0.0-preview.1`, a prerelease.** The storage kernel is complete; the public API may still change before
-> 1.0, as the first products adopt it. Tested on Windows; the first Linux run of the suite is pending. Changes per
-> version: [`CHANGELOG.md`](CHANGELOG.md).
+> **Status: `1.0.0-rc.1`, a release candidate for 1.0.** The storage kernel is complete. Tested on Windows and Linux. Changes per version: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Install
 
 ```sh
-dotnet add package SystemD.Crystal --version 1.0.0-preview.1
+dotnet add package SystemD.Crystal --version 1.0.0-rc.1
 ```
 
 Requires .NET 10. The package brings RocksDB's native libraries with it (the `RocksDB` package, pinned to one exact
@@ -69,44 +67,131 @@ using (var snapshot = shop.Snapshot())
 }
 ```
 
-More of the API:
+### Durability
 
 ```csharp
-// Durability per store, or per commit: Strict (synced), Interval (synced every few ms), Buffered.
-using var fast = CrystalStore.Open("/var/lib/cache", new CrystalOptions { Durability = DurabilityMode.Buffered });
+// Per store, or per commit: Strict (synced, the default), Interval (synced every few milliseconds), Buffered.
+using var cache = CrystalStore.Open("/var/lib/cache", new CrystalOptions { Durability = DurabilityMode.Buffered });
 
-// Box locks for read-modify-write: a striped lock per box, never held by Crystal across your code.
-using (shop.Locks.Lock(orders))
 using (var batch = shop.NewBatch())
 {
-    var current = batch.Get(orders, "counter"u8);  // a batch reads its own pending writes
-    batch.Put(orders, "counter"u8, Increment(current)); // Increment: your own encoding of the counter
+    batch.Put(orders, "draft-7"u8, "{}"u8);
+    batch.Commit(DurabilityMode.Buffered);         // this commit only
+}
+```
+
+### Keys and ranges
+
+Keys are bytes. Crystal's order-preserving encoders build composite keys whose byte order is the order you mean, and
+read them back; descending fields are the byte complement of ascending ones.
+
+```csharp
+// order/{customer}/{created, newest first}
+var key = new KeyWriter(stackalloc byte[128]);
+key.WriteString("c-7");
+var mark = key.BytesWritten;
+key.WriteTimestamp(DateTimeOffset.UtcNow);
+key.InvertLast(key.BytesWritten - mark);         // descending
+byte[] bytes = key.ToArray();
+
+var reader = new KeyReader(bytes);
+string customer = reader.ReadString();
+DateTimeOffset created = reader.ReadTimestamp(descending: true);
+
+// Ranges without hand-made successor keys: half-open [From, To), an empty bound is the box's start or end.
+KeyRange everyOrderOfC7 = KeyRanges.Prefix(Encoding.UTF8.GetBytes("c-7"));
+KeyRange exactlyOne     = KeyRanges.Point("order-1001"u8);
+KeyRange between        = KeyRanges.Between(KeyBound.Inclusive("a"u8.ToArray()), KeyBound.Exclusive("m"u8.ToArray()));
+```
+
+### Scans
+
+```csharp
+using (var snapshot = shop.Snapshot())
+{
+    // Forward: ascending, at most 100 records.
+    foreach (var record in snapshot.Scan(byCustomer, KeyRanges.Prefix("c-7/"u8), limit: 100)) { }
+
+    // Backward: the same range in descending order, newest first. A key equal to the range's end is never returned.
+    var latest = snapshot.Scan(orders, KeyRange.All, limit: 10, ScanDirection.Backward).ToList();
+}
+```
+
+Scans are always bounded to one box and a limit, and pinned to their snapshot. Dispose an enumeration you stop early
+(a `foreach` does it for you).
+
+### Batches
+
+```csharp
+using (var batch = shop.NewBatch())
+{
+    var current = batch.Get(orders, "counter"u8);                // reads its own pending writes
+    batch.Put(orders, "counter"u8, Increment(current));          // Increment: your own encoding of the counter
+    batch.DeleteRange(orders, KeyRanges.Prefix("draft-"u8));     // range deletes stay inside the box
+    foreach (var pending in batch.Scan(orders, KeyRange.All, limit: 10)) { } // scans see pending writes too
+
+    // What the batch holds, to bound a bulk load by bytes rather than by count.
+    if (batch.Bytes > 8 << 20) { /* commit and start the next page */ }
+    Console.WriteLine($"{batch.Count} operations, {batch.Bytes} bytes");
     batch.Commit();
 }
 
-// Newest first: a backward scan returns the range's keys in descending order.
-using (var snapshot = shop.Snapshot())
-{
-    var latest = snapshot.Scan(orders, KeyRanges.Prefix("order-"u8), limit: 10, ScanDirection.Backward).ToList();
-}
+// Optional guard against oversized keys: a longer key is refused when it is staged (KeyTooLargeException).
+var guarded = new CrystalOptions { MaxKeyBytes = 1024 };
+```
 
-// How big is a range? An estimate from RocksDB's metadata; it never scans.
-ulong bytes = shop.ApproximateBytes(orders, "order-"u8, "order."u8);
+### Locks
 
-// Key locks: lock one record (and the records that depend on it) without blocking a thread.
-await using (await shop.KeyLocks.LockAsync(orders, "order-1001"u8.ToArray()))
+Crystal never holds a lock across your code; locks are for your read-decide-write sequences. Both kinds are striped,
+taken in a fixed order (so two multi-lock callers cannot deadlock), not re-entrant, and released by disposing what they
+return, on any thread.
+
+```csharp
+// Box locks: one box, several, or every box.
+using (shop.Locks.Lock(orders)) { /* ... */ }
+await using (await shop.Locks.LockManyAsync([orders, byCustomer], cancellationToken)) { /* ... */ }
+
+// Key locks: one record and the records that depend on it, such as a document and its unique index entries.
+await using (await shop.KeyLocks.LockManyAsync(
+    [new LockKey(orders, "order-1001"u8.ToArray()), new LockKey(byCustomer, "c-7/order-1001"u8.ToArray())],
+    cancellationToken))
 {
     // read, decide, write
 }
+```
 
-// Boxes for delete-heavy key ranges (queues, moving indexes) keep scans fast as records come and go.
+The async forms wait without blocking a thread and honour cancellation. Box locks and key locks are independent: a box
+lock does not exclude key locks in that box. `CrystalOptions.KeyLockStripes` sets the key-lock table's size
+(default 256).
+
+### Size estimates
+
+```csharp
+// RocksDB's estimate of the bytes a range occupies, memtables included. It never scans; its cost does not grow with
+// the range. One range, or several in one call.
+ulong whole = shop.ApproximateBytes(orders, [], []);
+ulong[] parts = shop.ApproximateBytes(orders, [KeyRanges.Prefix("2026-"u8), KeyRanges.Prefix("2025-"u8)]);
+```
+
+An estimate, not a count: approximate, consistent with no snapshot, and 0 does not mean empty. Turning bytes into a
+number of records is yours, since you know your records' sizes.
+
+### Boxes and databases
+
+```csharp
+// Delete-heavy key ranges (queues, moving indexes) keep scans fast as records come and go.
 var queue = shop.Boxes.Create("jobs", BoxProfile.DeleteHeavy);
 
 // Databases and boxes are renamed, swapped and dropped atomically; open handles are never redirected.
 store.RenameDatabase(shop, "shop-v1");
 shop.Boxes.Drop(queue);
+```
 
-// Health: per database boxes, failures, last WAL sync and RocksDB's view, plus a running backup.
+### Status
+
+```csharp
+// One consistent snapshot for a health endpoint: per open database its boxes, failure, last WAL sync and RocksDB's
+// view (keys, live data, pending compaction, SST files per level, memtable bytes, write stalls), plus a running backup.
 StoreStatus status = store.Status();
 ```
 
