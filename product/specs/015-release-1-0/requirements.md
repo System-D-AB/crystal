@@ -101,11 +101,13 @@ goes to production on this release, so what its operators and its failover need 
 
 - **R7.1** **1.0.0-rc.3** carries R1–R6. Highway's 3.0 release candidate is built on it, from published packages
   only.
-- **R7.2** **Staging soak** before production: a Highway pair on the production host class, under the load harness
+- **R7.2** **Staging soak** before production: a Highway pair **on each production platform, Linux and Windows**, under the load harness
   for at least **72 hours**, with a primary kill, a planned handover and a standby restart at least once a day. Pass:
   no data loss, no unexpected gap, divergence or fence, slot drops only for standbys deliberately stopped, memory and
   disk flat after warm-up, every Crystal metric within its band (design § 6).
-- **R7.3** **Production canary:** one Highway deployment cut over by its fresh-start runbook (drain, wipe, start on
+- **R7.3** **Production canary:** one Highway deployment **on each platform, Linux and Windows** (Highway runs on both in
+  production, and Crystal's own platform-sensitive code — the store lock, folder deletion, directory sync, timers, TLS —
+  differs between them), each cut over by its fresh-start runbook (drain, wipe, start on
   Crystal), watched against design § 6's signals, with a planned failover drill in production.
 - **R7.4** **Holds up** means: for **14 days** in production (the window is the maintainer's to set), no incident
   caused by Crystal, every signal within its band, and the failover drill passed. An incident caused by Crystal is

@@ -157,8 +157,9 @@ public sealed class CpuUsageTests(ITestOutputHelper output)
 
     private static void WaitUntilIdentical(TestNode primary, TestNode standby)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(60);
-        while (DateTime.UtcNow < deadline)
+        // A monotonic clock: a wall-clock jump (a suspended VM, an NTP step) must not end the wait early (spec 015 T8).
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (waited.Elapsed < TimeSpan.FromSeconds(60))
         {
             try
             {

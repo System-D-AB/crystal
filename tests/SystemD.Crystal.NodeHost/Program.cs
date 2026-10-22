@@ -258,6 +258,8 @@ internal static class Program
                     return null;
                 case "status":
                     return JsonSerializer.SerializeToNode(store.Status());
+                case "replstatus": // spec 015 T8: role, epoch, followed positions and recent transitions, for a failure's message
+                    return JsonSerializer.SerializeToNode(store.Replication.Status());
                 case "listen":
                     store.Replication.Listen();
                     return store.Replication.ListenerEndpoint;

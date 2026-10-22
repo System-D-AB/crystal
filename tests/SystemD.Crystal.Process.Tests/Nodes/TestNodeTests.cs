@@ -154,8 +154,9 @@ public sealed class TestNodeTests
         primary.SyncAll();
 
         // Wait for the standby to hold every row of every database (compared against the primary's own counts).
-        var deadline = DateTime.UtcNow.AddSeconds(60);
-        while (DateTime.UtcNow < deadline)
+        // A monotonic clock: a wall-clock jump (a suspended VM, an NTP step) must not end the wait early (spec 015 T8).
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (waited.Elapsed < TimeSpan.FromSeconds(60))
         {
             if (dbs.All(StandbyHasEverything))
             {

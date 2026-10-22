@@ -46,7 +46,14 @@ a random delay, reopens the store, and checks against the printed numbers:
 | Relaxed | a prefix of what was committed | any suffix |
 
 In every mode: no batch appears without its predecessors (a prefix, never a hole), and a multi-box batch is whole or
-absent. The torn tail: truncate the last WAL file mid-record after a clean stop and reopen. The replicated pair: the
+absent.
+
+> **Corrected 2026-10-22.** The table above names the wrong modes and the wrong rule. Crystal's modes are **Strict,
+> Interval and Buffered** (`DurabilityMode`), and `006` R7.2 is the authority: a *process* kill leaves the operating
+> system's page cache intact, so **in all three modes every acknowledged batch survives**; the modes differ only on an
+> OS crash or power loss, which a process kill does not test (`006` out of scope). The writer mode also existed
+> already: the crash harness (`tools/SystemD.Crystal.CrashHarness`, `004` T4) takes `--mode`, and its runner audits
+> every value against the deterministic stream, which is the byte-for-byte comparison with a reference run. The torn tail: truncate the last WAL file mid-record after a clean stop and reopen. The replicated pair: the
 NodeHost process tests (`tests/SystemD.Crystal.NodeHost`) kill the primary mid-load; the standby is promoted, and
 every batch the old primary had acknowledged to the standby is on the new primary.
 

@@ -98,6 +98,19 @@ internal sealed class TestNode : IDisposable
     /// <summary>The store's <c>Status()</c>, as JSON.</summary>
     public JsonNode Status() => Send("status") ?? throw new InvalidOperationException("The node returned no status.");
 
+    /// <summary>The node's replication status (role, epoch, followed databases, recent transitions), for diagnostics.</summary>
+    public string ReplicationStatus()
+    {
+        try
+        {
+            return Send("replstatus")?.ToJsonString() ?? "(none)";
+        }
+        catch (Exception ex)
+        {
+            return $"(unavailable: {ex.Message})";
+        }
+    }
+
     public void CreateDatabase(string db) => Send("create", ("db", db));
 
     public uint Box(string db, string box) => Send("box", ("db", db), ("box", box))!.GetValue<uint>();

@@ -22,7 +22,7 @@
 - [x] **T6** Failed databases (R5; design § 4): `DatabaseFailedException`, refusal of commits, reads unaffected, no
   retry. Done when R7.5 passes. _Done. `002` T16's catalogue-write failure became this one mechanism. Logged at
   `Critical` through the store's `ILogger` until `007` gives it an event id; the counter waits for `007`._
-- [ ] **T7** _(Deferred by the maintainer, 2026-10-09. The crash harness it needs now exists: `004` T4, 2026-10-10.)_ The crash harness and the kill tests for all three modes and the torn tail (R7.1–R7.3; design § 5),
+- [x] **T7** _(Deferred by the maintainer, 2026-10-09. **Done 2026-10-22 by `015` T6, T7:** `Crash/DurabilityKillTests` and `Crash/TornTailTests` in the process tests; 20 kills a mode on Windows and Linux.)_ _(Originally deferred 2026-10-09. The crash harness it needs now exists: `004` T4, 2026-10-10.)_ The crash harness and the kill tests for all three modes and the torn tail (R7.1–R7.3; design § 5),
   ported from Highway; this is also `004` T4 and part of `004` T14. Done when 20 kills per mode pass on Windows.
 - [x] **T8** The group-commit test (R7.6). Done when 16 concurrent `Strict` writers sync fewer times than they commit,
   and the test fails if a lock is taken around the write. _Done differently: the binding has no WAL-sync counter
