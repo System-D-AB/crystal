@@ -11,14 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # Pinned images (spec 015 R1.3): an image migration must not change a release's result.
+        os: [windows-2025, ubuntu-24.04]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
 
@@ -28,27 +29,31 @@ jobs:
       - name: Build (Release)
         run: dotnet build SystemD.Crystal.slnx -c Release --no-restore
 
+      # Spec 015 T2: long cost probes (Category=LongProbe) run in the release gate, not here; a test that hangs fails
+      # within 3 minutes with its name in the blame sequence, instead of stalling the job.
       - name: Test (unit and architecture)
         run: |
-          dotnet test tests/SystemD.Crystal.Tests -c Release --no-build --logger "trx;LogFileName=unit.trx" --results-directory ./TestResults
+          dotnet test tests/SystemD.Crystal.Tests -c Release --no-build --filter "Category!=LongProbe" --blame-hang-timeout 3m --logger "trx;LogFileName=unit.trx" --results-directory ./TestResults
           dotnet test tests/SystemD.Crystal.Architecture.Tests -c Release --no-build --logger "trx;LogFileName=architecture.trx" --results-directory ./TestResults
 
       # Spec 004 R1.1: nodes in their own processes and hard kills, slower, so a step of their own.
       - name: Test (process)
-        run: dotnet test tests/SystemD.Crystal.Process.Tests -c Release --no-build --blame-hang-timeout 5m --logger "trx;LogFileName=process.trx" --results-directory ./TestResults
+        run: dotnet test tests/SystemD.Crystal.Process.Tests -c Release --no-build --blame-hang-timeout 3m --logger "trx;LogFileName=process.trx" --results-directory ./TestResults
 
       - name: Pack
         run: dotnet pack src/SystemD.Crystal/SystemD.Crystal.csproj -c Release --no-build -o ./artifacts
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ matrix.os }}
-          path: ./TestResults/**/*.trx
+          path: |
+            ./TestResults/**/*.trx
+            ./TestResults/**/Sequence_*.xml
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.os }}
           path: ./artifacts/*.nupkg

@@ -16,17 +16,27 @@ public sealed class DatabaseCostTests
     private const int Chunk = 100;
 
     [Fact]
-    public void LifecycleOperations_At10And1000Databases_WriteTheSameRegistryEntries()
+    public void LifecycleOperations_At10And100Databases_WriteTheSameRegistryEntries() => AssertFlatUpTo(100);
+
+    /// <summary>
+    /// The same at 1 000 databases: a long cost probe (spec 004 R4.1; spec 015 T2), about three minutes of database
+    /// creation, so it is left out of CI's everyday run and run by the release gate.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "LongProbe")]
+    public void LifecycleOperations_At10And1000Databases_WriteTheSameRegistryEntries() => AssertFlatUpTo(1000);
+
+    private static void AssertFlatUpTo(int databases)
     {
         using var dir = new TempStoreDirectory();
 
         GrowTo(dir.Path, 10);
         var at10 = MeasureLifecycle(dir.Path, "probe-10");
 
-        GrowTo(dir.Path, 1000);
-        var at1000 = MeasureLifecycle(dir.Path, "probe-1000");
+        GrowTo(dir.Path, databases);
+        var atMany = MeasureLifecycle(dir.Path, $"probe-{databases}");
 
-        Assert.Equal(at10, at1000);
+        Assert.Equal(at10, atMany);
         Assert.Equal(new Dictionary<string, ulong>
         {
             ["create"] = 4, // allocator; then alias, record, generation
