@@ -185,6 +185,16 @@ internal sealed class StoreEngine : IDisposable
     /// recreates an empty registry, and keeps <c>crystal.format</c>, <c>node.id</c> and <c>node.epoch</c>.
     /// Refuses a directory it cannot identify as a Crystal store, and a store that is open anywhere (R10.2).
     /// </summary>
+    /// <summary>
+    /// Compacts one open database end to end (spec 013 R4), inside it so a close waits for it. For
+    /// <see cref="CrystalStore.Compact"/>, which holds the store open and exclusive while it runs.
+    /// </summary>
+    internal void CompactOffline(CrystalDatabase database)
+    {
+        using var _ = database.EnterOperation();
+        OfflineCompaction.CompactEverything(database.Slot.Instance);
+    }
+
     internal static void Reset(string dataDirectory, CrystalOptions options)
     {
         ArgumentException.ThrowIfNullOrEmpty(dataDirectory);
@@ -1651,7 +1661,10 @@ internal sealed class StoreEngine : IDisposable
                         FilesPerLevel = StorageGauges.FilesPerLevel(instance),
                         ActiveMemtableBytes = StorageGauges.Sum(instance, "rocksdb.cur-size-active-mem-table"),
                         DelayedWriteRate = StorageGauges.Db(instance, "rocksdb.actual-delayed-write-rate"),
-                    }));
+                    })
+                {
+                    LatestPosition = (long)slot.LatestSequence, // spec 013 R5
+                });
             }
         }
 

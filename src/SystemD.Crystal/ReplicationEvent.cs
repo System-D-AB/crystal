@@ -7,44 +7,51 @@ using System;
 namespace SystemD.Crystal;
 
 /// <summary>What a <see cref="ReplicationEvent"/> reports (spec 003 R9.3).</summary>
+// Values are explicit and append-only (spec 015 R3.1): they reach metrics, logs and products' switches.
 public enum ReplicationEventKind
 {
     /// <summary>This node promoted to primary at a new epoch (R6.2).</summary>
-    Promoted,
+    Promoted = 0,
 
     /// <summary>This node demoted from primary (it saw a higher epoch, or was asked to).</summary>
-    Demoted,
+    Demoted = 1,
 
     /// <summary>This node fenced itself read-only (R6.5).</summary>
-    Fenced,
+    Fenced = 2,
 
     /// <summary>This node adopted a higher epoch (R6.3).</summary>
-    EpochChanged,
+    EpochChanged = 3,
 
     /// <summary>A standby slot is lagging past a fraction of the cap (R2.3).</summary>
-    SlotLagging,
+    SlotLagging = 4,
 
     /// <summary>A standby slot was dropped (lag cap or staleness, R2.3).</summary>
-    SlotDropped,
+    SlotDropped = 5,
 
     /// <summary>A database reported a gap and must re-bootstrap (R5.1).</summary>
-    Gap,
+    Gap = 6,
 
     /// <summary>A database diverged and must re-bootstrap (R5.2).</summary>
-    Divergence,
+    Divergence = 7,
 
     /// <summary>A peer's storage format or layout did not match; nothing was served or applied (R8).</summary>
-    FormatRefused,
+    FormatRefused = 8,
 
     /// <summary>Two primaries at the same epoch were detected (R6.4): both ids and endpoints are in the detail.</summary>
-    Conflict,
+    Conflict = 9,
 
     /// <summary>
     /// This node was promoted while some of its databases were marked for re-bootstrap (spec 011 R2.4): the detail names
     /// each and why. A database marked for a divergence was given a fresh history, so its other standbys re-bootstrap
     /// from this node; the product decides whether to serve it.
     /// </summary>
-    PromotedWithPendingResync,
+    PromotedWithPendingResync = 10,
+
+    /// <summary>
+    /// A fenced primary returned to primary at the epoch it was fenced at (<see cref="CrystalReplication.Unfence"/>, spec
+    /// 013 R10): it serves and accepts writes again, with no new epoch.
+    /// </summary>
+    Unfenced = 11,
 }
 
 /// <summary>

@@ -74,7 +74,7 @@ public sealed class ReplicationObservabilityTests : IDisposable
         store.Replication.Fence("two");
 
         var status = store.Replication.Status();
-        Assert.Equal("fenced", status.Role);
+        Assert.Equal(ReplicationRole.Fenced, status.Role);
         Assert.True(status.Epoch >= 2);
         Assert.Equal(endpoint, status.ListenerEndpoint);
         Assert.Null(status.FollowedPrimary);

@@ -185,6 +185,18 @@ var queue = shop.Boxes.Create("jobs", BoxProfile.DeleteHeavy);
 // Databases and boxes are renamed, swapped and dropped atomically; open handles are never redirected.
 store.RenameDatabase(shop, "shop-v1");
 shop.Boxes.Drop(queue);
+
+// Every live box with its handle, for a product walking all of them (a dump, a sweep): no Find per box.
+foreach (BoxInfo info in shop.Boxes.List()) { Box box = info.Handle; /* read, scan, write, lock */ }
+```
+
+**Offline compaction**, for a maintenance window (Crystal compacts in the background while open, so it is rarely
+needed): with the store closed everywhere, compact every database or the ones named, and read back the size before
+and after each one. Nothing a database holds changes.
+
+```csharp
+CompactionResult result = CrystalStore.Compact("/data/shop");   // refused while the store is open anywhere
+foreach (var db in result.Databases) Console.WriteLine($"{db.Name}: {db.BytesBefore} → {db.BytesAfter} bytes");
 ```
 
 ### Status
@@ -193,6 +205,9 @@ shop.Boxes.Drop(queue);
 // One consistent snapshot for a health endpoint: per open database its boxes, failure, last WAL sync and RocksDB's
 // view (keys, live data, pending compaction, SST files per level, memtable bytes, write stalls), plus a running backup.
 StoreStatus status = store.Status();
+
+// A database's latest committed position: the sequence replication speaks in, known with no standby attached.
+long position = status.Databases.Single(d => d.Name == "shop").LatestPosition;
 ```
 
 `CrystalOptions` also takes a logger factory and a meter factory: every event has a stable id and every instrument a
@@ -265,6 +280,23 @@ Replication = new ReplicationOptions
 The wait is a timer, so it lasts at least the operating system's timer resolution (about 15.6 ms on Windows). Under
 Highway's load harness it brought a Strict commit with a standby attached from 3.5 ms to 2.2 ms, the same as with no
 standby, for a standby lag of about one window ([`engineering/measurements.md`](engineering/measurements.md)).
+
+**A product's failover policy** has the mechanics it needs without workarounds:
+
+```csharp
+// Promote above every epoch the product has heard of (an announce, a client that saw a newer primary), in one step.
+standby.Replication.Promote("node-a unreachable", minimumEpoch: highestEpochHeard);
+
+// A standby's link to its primary: a follower parked in a long poll and one whose primary vanished look different.
+ReplicationStatus repl = standby.Replication.Status();
+bool linked = repl.ConnectedToPrimary;
+DateTimeOffset? heard = repl.LastReplyFromPrimary;   // never older than LongPollMax while healthy
+
+// A fence as a backstop: a primary that lost every peer fences itself, and lifts it at the same epoch when contact
+// returns, so its standbys continue where they were. Refused if another node has been primary since.
+primary.Replication.Fence("lost every peer and client");
+primary.Replication.Unfence("contact returned");
+```
 
 Epochs fence a stale primary. A standby that applied past the point where the new primary's history diverges is
 detected and re-bootstrapped, never left holding writes the primary never had. Crystal guarantees these mechanics;

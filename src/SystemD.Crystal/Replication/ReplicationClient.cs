@@ -25,16 +25,20 @@ internal sealed class ReplicationClient
     private int _bufferStart;
     private int _bufferEnd;
 
-    public ReplicationClient(Stream stream, string nodeId, string secret, Action? onFrameRefused = null, TimeSpan? requestTimeout = null)
+    public ReplicationClient(Stream stream, string nodeId, string secret, Action? onFrameRefused = null, TimeSpan? requestTimeout = null, Action? onReply = null)
     {
         _requestTimeout = requestTimeout;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _nodeId = nodeId ?? throw new ArgumentNullException(nameof(nodeId));
         _secret = secret ?? throw new ArgumentNullException(nameof(secret));
         _onFrameRefused = onFrameRefused;
+        _onReply = onReply;
     }
 
     private readonly Action? _onFrameRefused;
+
+    // Spec 013 R8: called with every reply read, so a follower knows when it last heard from its primary.
+    private readonly Action? _onReply;
 
     // The most any one reply is waited for (review 2026-10-13, S4); null: as long as the caller's token allows.
     private readonly TimeSpan? _requestTimeout;
@@ -185,6 +189,7 @@ internal sealed class ReplicationClient
                         _bufferStart = _bufferEnd = 0;
                     }
 
+                    _onReply?.Invoke();
                     return value!;
                 }
 

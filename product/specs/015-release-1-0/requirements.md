@@ -77,6 +77,13 @@ goes to production on this release, so what its operators and its failover need 
 - **R4.2** **Already met:** `013` R7 (a replaced database's handle says so, 1.0.0-rc.1) and R11 (Linux directory sync).
 - **R4.3** **Moved to 1.x unless the maintainer takes it:** `013` R10 (`Unfence`: Highway keeps its own write gate);
   `012` R7 (`CrystalSequence`) and R10 (lighter batches).
+- **R4.5** *(Decided by the maintainer 2026-10-22, D2.)* **Every Highway feature of `013` is in 1.0:** R4, R5, R6, R8,
+  R9 **and R10** (`Unfence`), so Highway runs 1.0 in production on Crystal's own mechanisms, without its workarounds,
+  and production exercises them. R4.3's deferral of R10 is withdrawn.
+- **R4.6** *(Addendum 2026-10-22, from the API review, T14.)* R4.1's names changed before the freeze: R8 is
+  `ReplicationStatus.ConnectedToPrimary` and `ReplicationStatus.LastReplyFromPrimary` (a standby follows one primary,
+  so the link is reported once, not per database); R9 is `BoxInfo.Handle` on every box `BoxCatalog.List()` returns,
+  in place of a second listing.
 - **R4.4** Each item taken follows its `013` requirement and its tests, and changes no format (`013` R12).
 
 ### R5 — Numbers are published from the benchmark harness
@@ -85,6 +92,9 @@ goes to production on this release, so what its operators and its failover need 
 - **R5.2** `013` R2: the `full` run on Windows and Linux, Release, with the multi-box `command` workload and the
   RocksDB baseline runner, recorded in `engineering/measurements.md`.
 - **R5.3** Every performance claim in the README and the CHANGELOG cites a measurement there.
+- **R5.4** *(Decided by the maintainer 2026-10-22, D7.)* **No benchmark runs in this repository for 1.0.** Highway,
+  running the release candidate, is the measurement: its harness and production numbers decide whether 1.0 holds.
+  R5.1 and R5.2 move to 1.x. R5.3 still applies: a claim cites a measurement, Highway's included.
 
 ### R6 — The release gates exist and pass
 
@@ -138,8 +148,9 @@ goes to production on this release, so what its operators and its failover need 
 | # | Decision | Proposed |
 |---|---|---|
 | D1 | `014` R3.1's median lag (14–15 ms against 10 ms on Windows) | Restate as "at most one gather window plus a round trip" |
-| D2 | `013` requirements taken for 1.0 | R4, R5, R6, R8, R9 (R4.1); R10 to 1.x |
+| D2 | `013` requirements taken for 1.0 | R4, R5, R6, R8, R9 (R4.1); R10 to 1.x. **Decided 2026-10-22: all, R10 included (R4.5)** |
 | D3 | `012` R7 `CrystalSequence` and R10 lighter batches | 1.x |
 | D4 | Staging soak length and production window | 72 hours; 14 days |
 | D5 | Which Highway deployment is the canary, and who runs its runbook | the maintainer |
 | D6 | Highway-side work (gates, runbooks) done by whom, in Highway's repository | the maintainer |
+| D7 | Benchmark runs in this repository for 1.0 (R5) | **Decided 2026-10-22: none; Highway is the measurement (R5.4)** |

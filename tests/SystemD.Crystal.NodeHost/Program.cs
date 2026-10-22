@@ -305,9 +305,15 @@ internal static class Program
         {
             var db = Database(request);
             var name = Text(request, "box");
-            var box = db.Boxes.Find(name) ?? throw new BoxNotFoundException(name, $"Box '{name}' does not exist.");
+            var box = db.Boxes.Find(name) ?? throw new BoxNotFoundException($"Box '{name}' does not exist.");
             return (db, box);
         }
+
+        /// <summary>
+        /// The node host's own "no such box": the reply names the type, and the tests match that name. Crystal's exception
+        /// constructors are internal (spec 015 R3.1); an application reports its own errors.
+        /// </summary>
+        private sealed class BoxNotFoundException(string message) : Exception(message);
 
         private static string Text(JsonObject request, string field) =>
             request[field]?.GetValue<string>() ?? throw new ArgumentException($"'{field}' is required.");

@@ -590,7 +590,7 @@ internal sealed class DatabaseContext : IDisposable
         }
     }
 
-    private Box Handle(uint id, string name) => new(id, name) { Catalogue = this };
+    private Box Handle(uint id, string name) => new(id, name, catalogue: this);
 
     /// <summary>
     /// Refuses a handle this database did not issue: one from another database (whose ids overlap this one's), from
@@ -867,7 +867,10 @@ internal sealed class DatabaseContext : IDisposable
             {
                 if (record.State == LiveState)
                 {
-                    list.Add(new BoxInfo(id, record.Name, Enum.Parse<BoxProfile>(record.Profile), new DateTimeOffset(record.CreatedTicks, TimeSpan.Zero)));
+                    list.Add(new BoxInfo(id, record.Name, Enum.Parse<BoxProfile>(record.Profile), new DateTimeOffset(record.CreatedTicks, TimeSpan.Zero))
+                    {
+                        Handle = Handle(id, record.Name), // spec 013 R9
+                    });
                 }
             }
 

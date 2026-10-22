@@ -112,6 +112,9 @@ collects them, without holding any store lock, and stop reading when the store c
 | 2010 | `ReplicationConflict` | Error | Two primaries at the same epoch. **Alert.** The product resolves it. |
 | 2011 | `ReplicationConnected` | Information | A replication connection was established. |
 | 2012 | `ReplicationDisconnected` | Information | A replication connection was lost. |
+| 2013 | `ReplicationPromotedWithPendingResync` | Warning | Promoted with databases marked for re-bootstrap. |
+| 2014 | `ReplicationEventHandlerFailed` | Error | A product's handler of a replication event threw; later events are still delivered. |
+| 2015 | `ReplicationUnfenced` | Warning | A fenced primary returned to primary at the same epoch (`013` R10). |
 
 Ids are never reused. 1000s the store, 1100s the registry, 1200s recovery, 1300s databases, 1400s boxes, 1500s
 durability, 1600s storage, 1700s backup and restore (`010`), 2000s replication (`003`). No backup event names a key or

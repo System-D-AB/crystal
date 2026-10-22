@@ -76,6 +76,19 @@ internal sealed class ReplicationFollower : IAsyncDisposable
     /// <summary>Each followed database's position and its primary's latest, as of the last reply (spec 011 R10.4).</summary>
     public IReadOnlyList<(string Uid, long Position, long PrimaryLatest)> Positions => Volatile.Read(ref _positions);
 
+    // Spec 013 R8: when the follower last read a reply from its primary (a page, an empty long-poll reply, a DATABASES
+    // reply, a snapshot chunk, the handshake), on the engine clock; and whether its main connection is up now.
+    private long _lastReplyTicks;
+    private int _connected;
+
+    /// <summary>When a reply from the primary was last read, or null if none yet (spec 013 R8.1).</summary>
+    public DateTimeOffset? LastReply => Interlocked.Read(ref _lastReplyTicks) is var ticks and not 0 ? new DateTimeOffset(ticks, TimeSpan.Zero) : null;
+
+    /// <summary>Whether the follower holds an authenticated connection to its primary now (spec 013 R8.2).</summary>
+    public bool Connected => Volatile.Read(ref _connected) == 1;
+
+    private void StampReply() => Interlocked.Exchange(ref _lastReplyTicks, _engine.Clock.GetUtcNow().UtcTicks);
+
     private void PublishPositions()
     {
         var positions = new List<(string Uid, long Position, long PrimaryLatest)>(_followed.Count);
@@ -214,7 +227,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
         var (host, port) = ParseEndpoint(_primaryEndpoint);
         await using var stream = await ReplicationTls.ConnectAsync(host, port, _options, ct, _options.RequestTimeout).ConfigureAwait(false);
 
-        var client = new ReplicationClient(stream, _nodeId, _options.Secret, () => _metrics?.FrameRefused("standby"), _options.RequestTimeout);
+        var client = new ReplicationClient(stream, _nodeId, _options.Secret, () => _metrics?.FrameRefused("standby"), _options.RequestTimeout, StampReply);
         await client.HandshakeAsync(_epoch.RoleName, _epoch.Epoch, ct).ConfigureAwait(false);
 
         if (client.PrimaryEpoch < 1 || client.PrimaryEpoch > ReplicationProtocol.MaxEpoch)
@@ -235,12 +248,15 @@ internal sealed class ReplicationFollower : IAsyncDisposable
             Observability.CrystalLog.ReplicationConnected(_logger, _epoch.Epoch, $"following {client.PrimaryNodeId} at {_primaryEndpoint}");
         }
 
+        Volatile.Write(ref _connected, 1); // authenticated, and the primary's epoch accepted (spec 013 R8.2)
+        StampReply();
         try
         {
             await PumpAsync(client, ct).ConfigureAwait(false);
         }
         finally
         {
+            Volatile.Write(ref _connected, 0);
             if (_logger is not null)
             {
                 Observability.CrystalLog.ReplicationDisconnected(_logger, _epoch.Epoch, $"no longer following {client.PrimaryNodeId} at {_primaryEndpoint}");
@@ -632,7 +648,7 @@ internal sealed class ReplicationFollower : IAsyncDisposable
                     var (host, port) = ParseEndpoint(_primaryEndpoint);
                     var stream = await ReplicationTls.ConnectAsync(host, port, _options, c, _options.RequestTimeout).ConfigureAwait(false);
                     streams.Add(stream);
-                    var client = new ReplicationClient(stream, _nodeId, _options.Secret, () => _metrics?.FrameRefused("standby"), _options.RequestTimeout);
+                    var client = new ReplicationClient(stream, _nodeId, _options.Secret, () => _metrics?.FrameRefused("standby"), _options.RequestTimeout, StampReply);
                     await client.HandshakeAsync(_epoch.RoleName, _epoch.Epoch, c).ConfigureAwait(false);
                     return client;
                 },

@@ -75,7 +75,7 @@ public sealed class CrystalDatabase
     /// a number of entries belongs to the product, which knows its entries' widths. It never scans: its cost does not
     /// grow with the range. A read: allowed on a standby and on a failed database.</para>
     /// </summary>
-    public ulong ApproximateBytes(Box box, ReadOnlySpan<byte> from, ReadOnlySpan<byte> to)
+    public long ApproximateBytes(Box box, ReadOnlySpan<byte> from, ReadOnlySpan<byte> to)
     {
         if (!from.IsEmpty && !to.IsEmpty && from.SequenceCompareTo(to) > 0)
         {
@@ -86,18 +86,19 @@ public sealed class CrystalDatabase
     }
 
     /// <summary>Estimates one <see cref="KeyRange"/> of <paramref name="box"/> (spec 012 R2, R4.1).</summary>
-    public ulong ApproximateBytes(Box box, KeyRange range) => ApproximateBytes(box, [range])[0];
+    public long ApproximateBytes(Box box, KeyRange range) => ApproximateBytes(box, [range])[0];
 
     /// <summary>
     /// Estimates several ranges of one box in one native call (spec 012 R2.3): one value per range, in order. See
     /// <see cref="ApproximateBytes(Box, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/> for what the numbers mean.
     /// </summary>
-    public ulong[] ApproximateBytes(Box box, IReadOnlyList<KeyRange> ranges)
+    public long[] ApproximateBytes(Box box, IReadOnlyList<KeyRange> ranges)
     {
         ArgumentNullException.ThrowIfNull(ranges);
         using var _ = EnterOperation();
         _slot.Context.EnsureOwned(box);
-        return _slot.Context.ApproximateBytes(box.Id, [.. ranges.Select(r => (r.From ?? [], r.To ?? []))]);
+        // A long like every other byte count of the API (spec 015 R3.1); an estimate past long's range is not a real size.
+        return [.. _slot.Context.ApproximateBytes(box.Id, [.. ranges.Select(r => (r.From ?? [], r.To ?? []))]).Select(b => (long)Math.Min(b, long.MaxValue))];
     }
 
     /// <summary>

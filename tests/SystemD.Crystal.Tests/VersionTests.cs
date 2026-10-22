@@ -1,4 +1,4 @@
-// The version Crystal reports (metrics, backup manifests) is the package's: CrystalVersion.Value is a constant beside
+// The version Crystal reports (metrics, backup manifests) is the package's: CrystalVersion.Value is a value kept beside
 // <Version> in the project file, so this test keeps the two from drifting apart.
 
 using System.Reflection;

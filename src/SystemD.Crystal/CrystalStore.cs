@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using SystemD.Crystal.Backup;
@@ -126,6 +127,79 @@ public sealed class CrystalStore : IDisposable
         ArgumentException.ThrowIfNullOrEmpty(dataDirectory);
         StoreEngine.Reset(dataDirectory, options ?? new CrystalOptions());
     }
+
+    /// <summary>
+    /// Compacts a store offline (spec 013 R4): every column family of each database, end to end, dropping every
+    /// tombstone and range delete it can, so the folder holds only live data. For an operator's maintenance window;
+    /// Crystal compacts in the background while open, so a store needs this rarely, if ever. It changes no data: what
+    /// each database holds reads back exactly the same.
+    /// <para>Synchronous and long-running: it takes as long as rewriting the databases does, on the calling thread.</para>
+    /// <para>A replicated database's write-ahead log is rewritten into table files, so a standby that had not yet
+    /// received those batches may meet a gap and re-bootstrap from a snapshot when replication resumes.</para>
+    /// </summary>
+    /// <param name="dataDirectory">The store's data directory.</param>
+    /// <param name="options">Which databases; null compacts every one.</param>
+    /// <returns>Per database, its folder's size before and after, and the time taken.</returns>
+    /// <exception cref="StoreLockedException">The store is open, in this process or another: close it first.</exception>
+    /// <exception cref="DatabaseNotFoundException">A database named in <paramref name="options"/> does not exist; nothing was compacted.</exception>
+    /// <exception cref="CrystalFormatException">The directory is not a Crystal store this build reads.</exception>
+    /// <exception cref="DirectoryNotFoundException">The directory does not exist.</exception>
+    /// <exception cref="ArgumentException"><see cref="CompactOptions.Store"/> sets replication.</exception>
+    public static CompactionResult Compact(string dataDirectory, CompactOptions? options = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(dataDirectory);
+        var fullPath = Path.GetFullPath(dataDirectory);
+        if (!Directory.Exists(fullPath))
+        {
+            throw new DirectoryNotFoundException($"There is no store to compact: directory '{fullPath}' does not exist.");
+        }
+
+        // Identify the store before writing anything, so a foreign directory never gets a lock file (as Reset does).
+        StoreFormat.VerifyExisting(fullPath);
+
+        // A compaction serves and follows nothing; opening with replication could also resume a scheduled rejoin.
+        var storeOptions = options?.Store ?? new CrystalOptions();
+        if (storeOptions.Replication is not null)
+        {
+            throw new ArgumentException(
+                "CompactOptions.Store must not set Replication: a compaction serves and follows nothing, and opening with " +
+                "replication could resume a scheduled rejoin. Pass the store's options without it.", nameof(options));
+        }
+
+        var clock = storeOptions.Clock; // time only through the options' clock, as everywhere in Crystal
+        var compacted = new List<(string Name, string Folder, long Before, TimeSpan Elapsed)>();
+        using (var store = Open(fullPath, storeOptions))
+        {
+            var live = store.ListDatabases().Select(d => d.Name).ToList();
+            var names = options?.Databases is { } chosen ? chosen.Distinct(StringComparer.Ordinal).ToList() : live;
+            foreach (var name in names)
+            {
+                if (!live.Contains(name, StringComparer.Ordinal))
+                {
+                    throw new DatabaseNotFoundException(name, $"Database '{name}' does not exist in the store at '{fullPath}'; nothing was compacted.");
+                }
+            }
+
+            foreach (var name in names)
+            {
+                var database = store.OpenDatabase(name);
+                var folder = Path.Combine(fullPath, StoreEngine.DatabaseFolderName(database.Id));
+                var before = FolderBytes(folder);
+                var started = clock.GetTimestamp();
+                store._engine.CompactOffline(database);
+                compacted.Add((name, folder, before, clock.GetElapsedTime(started)));
+            }
+        }
+
+        return new CompactionResult([.. compacted.Select(c => new DatabaseCompaction(c.Name, c.Before, FolderBytes(c.Folder), c.Elapsed))]);
+    }
+
+    /// <summary>A database's data on disk: its table files and write-ahead logs, not RocksDB's diagnostic logs.</summary>
+    private static long FolderBytes(string folder) =>
+        Directory.Exists(folder)
+            ? new DirectoryInfo(folder).EnumerateFiles("*", SearchOption.AllDirectories)
+                .Where(f => f.Extension is ".sst" or ".log").Sum(f => f.Length)
+            : 0;
 
     /// <summary>
     /// Creates a new database in the store (spec 005 R5.1).

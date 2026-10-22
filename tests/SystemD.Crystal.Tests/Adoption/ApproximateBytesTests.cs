@@ -63,8 +63,8 @@ public sealed class ApproximateBytesTests : IDisposable
         Fill(full, 10_000);
 
         Assert.True(_db.ApproximateBytes(full, [], []) > 0);
-        Assert.Equal(0UL, _db.ApproximateBytes(untouched, [], []));
-        Assert.Equal(0UL, _db.ApproximateBytes(full, Key(5), Key(5)));
+        Assert.Equal(0L, _db.ApproximateBytes(untouched, [], []));
+        Assert.Equal(0L, _db.ApproximateBytes(full, Key(5), Key(5)));
     }
 
     [Fact]
@@ -109,7 +109,7 @@ public sealed class ApproximateBytesTests : IDisposable
         var together = _db.ApproximateBytes(box, ranges);
 
         Assert.Equal(ranges.Select(r => _db.ApproximateBytes(box, r.From, r.To)), together);
-        Assert.Equal(0UL, together[2]);
+        Assert.Equal(0L, together[2]);
     }
 
     [Fact]
@@ -118,7 +118,7 @@ public sealed class ApproximateBytesTests : IDisposable
         var box = _db.Boxes.Create("box");
         Assert.Equal("from", Assert.Throws<ArgumentException>(() => _db.ApproximateBytes(box, Key(9), Key(1))).ParamName);
         Assert.Throws<ArgumentException>(() => _db.ApproximateBytes(box, [new KeyRange(Key(9), Key(1))]));
-        Assert.Equal(0UL, _db.ApproximateBytes(box, KeyRange.Empty));
+        Assert.Equal(0L, _db.ApproximateBytes(box, KeyRange.Empty));
 
         var other = _store.CreateDatabase("other").Boxes.Create("box");
         Assert.Throws<BoxNotInDatabaseException>(() => _db.ApproximateBytes(other, [], []));

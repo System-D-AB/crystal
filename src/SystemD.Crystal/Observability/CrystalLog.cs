@@ -210,6 +210,10 @@ internal static partial class CrystalLog
         Message = "Replication: a handler of the {Kind} event threw; later events are still delivered.")]
     public static partial void ReplicationEventHandlerFailed(ILogger logger, string kind, Exception exception);
 
+    [LoggerMessage(EventId = 2015, EventName = nameof(CrystalLogEvents.ReplicationUnfenced), Level = LogLevel.Warning,
+        Message = "Replication: unfenced, primary again at epoch {Epoch}. {Detail}")]
+    public static partial void ReplicationUnfenced(ILogger logger, long epoch, string detail);
+
     [LoggerMessage(EventId = 2011, EventName = nameof(CrystalLogEvents.ReplicationConnected), Level = LogLevel.Information,
         Message = "Replication: connected at epoch {Epoch}. {Detail}")]
     public static partial void ReplicationConnected(ILogger logger, long epoch, string detail);

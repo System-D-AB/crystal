@@ -243,8 +243,12 @@ replicate is always writable). A local write, and a change to the set of replica
 role and counted until it ends; standing down (a demotion, a fence, a higher epoch) waits for the writes already
 admitted, so once it returns nothing local lands after it. The role survives a restart: a demoted node, or a standby, comes back a standby; a
 fenced node comes back a standby too, since a restart ends the fence but never makes a node that stood down a primary
-again. **Promotion** stops following, gives every open database a new incarnation at what the node received, then
-increments the epoch and persists it with the role **before** the node accepts writes or serves (a persist failure
+again. **Unfence** (spec `013` R10) lifts a fence at the same epoch: a node that was a primary when it fenced, and has
+seen no higher epoch since, returns to primary at that epoch and raises `Unfenced`; anything else is refused, since a
+fenced standby returning as primary at the same epoch would make two primaries at one epoch. **Promotion** stops
+following, gives every open database a new incarnation at what the node received, then
+increments the epoch (to `max(epoch + 1, minimumEpoch)` when a floor is given, at most 2^62, spec `013` R6) and
+persists it with the role **before** the node accepts writes or serves (a persist failure
 fails the promotion with an `IOException`: epoch and role unchanged, no longer following). A database marked for
 re-bootstrap for a divergence (or a rejoin) is given a fresh history, claiming nothing of the log it followed, since
 it may hold batches that log lacks; one marked for a gap continues it; a `PromotedWithPendingResync` event names them
@@ -365,7 +369,10 @@ is on, plus `bytes_shipped` (primary), `pages_applied`, `bytes_applied`, `bootst
 tail page, `behind` or `landing` for a WAL page), and records `crystal.replication.ship_delay`, the time from commit to shipping of the oldest
 batch of each page served from the tail (spec 014). A lag in time is exact while the tail holds the first batch the
 standby lacks (the tail keeps each batch's commit time) and from the commit timeline's 100 ms samples beyond it. `Status().Followed` lists each database a standby follows with its position, the
-primary's latest from the last reply, and the lag. Log events in `CrystalLogEvents`' 2000s range, one per event of
+primary's latest from the last reply, and the lag. `Status().ConnectedToPrimary` says whether the follower holds an
+authenticated connection to its primary now, and `LastReplyFromPrimary` when it last read a reply from it (a page, an
+empty long-poll reply, a snapshot chunk) (spec `013` R8). While the link is healthy `LastReplyFromPrimary` is never
+older than `LongPollMax` plus a round trip. Log events in `CrystalLogEvents`' 2000s range, one per event of
 R9.3 plus connected/lost (2011/2012, on the follower and on the listener's authenticated connections). A standby that
 adopts a newer epoch from its primary (handshake, page or snapshot) raises `EpochChanged`. **Events are
 delivered on Crystal's own thread** (`ReplicationEventPump`), one at a time and in order, never on the thread that

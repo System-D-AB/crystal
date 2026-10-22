@@ -18,7 +18,7 @@ public sealed class CrystalFormatException : Exception
     public string WayForward { get; }
 
     /// <summary>Initializes a new instance of <see cref="CrystalFormatException"/>.</summary>
-    public CrystalFormatException(
+    internal CrystalFormatException(
         string message,
         string? foundFormat = null,
         string supportedFormat = "crystal 1",
@@ -42,7 +42,7 @@ public sealed class StoreLockedException : Exception
     public string DataDirectory { get; }
 
     /// <summary>Initializes a new instance of <see cref="StoreLockedException"/>.</summary>
-    public StoreLockedException(string dataDirectory, string message, Exception? innerException = null)
+    internal StoreLockedException(string dataDirectory, string message, Exception? innerException = null)
         : base(message, innerException)
     {
         DataDirectory = dataDirectory;
@@ -61,20 +61,20 @@ public sealed class DatabaseNotFoundException : Exception
     public uint? DatabaseId { get; }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseNotFoundException"/> with a message.</summary>
-    public DatabaseNotFoundException(string message)
+    internal DatabaseNotFoundException(string message)
         : base(message)
     {
     }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseNotFoundException"/> with a database name.</summary>
-    public DatabaseNotFoundException(string databaseName, string message)
+    internal DatabaseNotFoundException(string databaseName, string message)
         : base(message)
     {
         DatabaseName = databaseName;
     }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseNotFoundException"/> with a database id.</summary>
-    public DatabaseNotFoundException(uint databaseId, string message)
+    internal DatabaseNotFoundException(uint databaseId, string message)
         : base(message)
     {
         DatabaseId = databaseId;
@@ -90,7 +90,7 @@ public sealed class DatabaseNameTakenException : Exception
     public string DatabaseName { get; }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseNameTakenException"/>.</summary>
-    public DatabaseNameTakenException(string databaseName, string message)
+    internal DatabaseNameTakenException(string databaseName, string message)
         : base(message)
     {
         DatabaseName = databaseName;
@@ -106,7 +106,7 @@ public sealed class ReservedNameException : Exception
     public string DatabaseName { get; }
 
     /// <summary>Initializes a new instance of <see cref="ReservedNameException"/>.</summary>
-    public ReservedNameException(string databaseName, string message)
+    internal ReservedNameException(string databaseName, string message)
         : base(message)
     {
         DatabaseName = databaseName;
@@ -127,7 +127,7 @@ public sealed class DatabaseLimitException : Exception
     public int Limit { get; }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseLimitException"/>.</summary>
-    public DatabaseLimitException(string databaseName, int limit, string message)
+    internal DatabaseLimitException(string databaseName, int limit, string message)
         : base(message)
     {
         DatabaseName = databaseName;
@@ -141,7 +141,7 @@ public sealed class DatabaseLimitException : Exception
 public sealed class NotPrimaryException : Exception
 {
     /// <summary>Initializes a new instance of <see cref="NotPrimaryException"/>.</summary>
-    public NotPrimaryException(string message)
+    internal NotPrimaryException(string message)
         : base(message)
     {
     }
@@ -159,16 +159,16 @@ public sealed class BoxNotFoundException : Exception
     public uint? BoxId { get; }
 
     /// <summary>Initializes a new instance of <see cref="BoxNotFoundException"/>.</summary>
-    public BoxNotFoundException(string message) : base(message) { }
+    internal BoxNotFoundException(string message) : base(message) { }
 
     /// <summary>Initializes a new instance of <see cref="BoxNotFoundException"/> with a name.</summary>
-    public BoxNotFoundException(string boxName, string message) : base(message)
+    internal BoxNotFoundException(string boxName, string message) : base(message)
     {
         BoxName = boxName;
     }
 
     /// <summary>Initializes a new instance of <see cref="BoxNotFoundException"/> with an id.</summary>
-    public BoxNotFoundException(uint boxId, string message) : base(message)
+    internal BoxNotFoundException(uint boxId, string message) : base(message)
     {
         BoxId = boxId;
     }
@@ -183,7 +183,7 @@ public sealed class BoxNameTakenException : Exception
     public string BoxName { get; }
 
     /// <summary>Initializes a new instance of <see cref="BoxNameTakenException"/>.</summary>
-    public BoxNameTakenException(string boxName, string message) : base(message)
+    internal BoxNameTakenException(string boxName, string message) : base(message)
     {
         BoxName = boxName;
     }
@@ -200,7 +200,7 @@ public sealed class DatabaseFailedException : Exception
     public string Database { get; }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseFailedException"/>.</summary>
-    public DatabaseFailedException(string database, string message, Exception? innerException = null)
+    internal DatabaseFailedException(string database, string message, Exception? innerException = null)
         : base(message, innerException)
     {
         Database = database;
@@ -220,7 +220,7 @@ public sealed class BoxNotInDatabaseException : Exception
     public string? BoxName { get; }
 
     /// <summary>Initializes a new instance of <see cref="BoxNotInDatabaseException"/>.</summary>
-    public BoxNotInDatabaseException(uint boxId, string? boxName, string message) : base(message)
+    internal BoxNotInDatabaseException(uint boxId, string? boxName, string message) : base(message)
     {
         BoxId = boxId;
         BoxName = boxName;
@@ -239,13 +239,13 @@ public sealed class BoxDroppedException : Exception
     public uint BoxId { get; }
 
     /// <summary>Initializes a new instance of <see cref="BoxDroppedException"/>.</summary>
-    public BoxDroppedException(uint boxId, string message) : base(message)
+    internal BoxDroppedException(uint boxId, string message) : base(message)
     {
         BoxId = boxId;
     }
 
     /// <summary>Initializes a new instance of <see cref="BoxDroppedException"/> with a name and id.</summary>
-    public BoxDroppedException(uint boxId, string boxName, string message) : base(message)
+    internal BoxDroppedException(uint boxId, string boxName, string message) : base(message)
     {
         BoxId = boxId;
         BoxName = boxName;
@@ -263,7 +263,7 @@ public sealed class BackupDestinationException : Exception
     public string Destination { get; }
 
     /// <summary>Initializes a new instance of <see cref="BackupDestinationException"/>.</summary>
-    public BackupDestinationException(string destination, string message)
+    internal BackupDestinationException(string destination, string message)
         : base(message)
     {
         Destination = destination;
@@ -280,7 +280,7 @@ public sealed class BackupRootLockedException : Exception
     public string RootPath { get; }
 
     /// <summary>Initializes a new instance of <see cref="BackupRootLockedException"/>.</summary>
-    public BackupRootLockedException(string rootPath, string message, Exception? innerException = null)
+    internal BackupRootLockedException(string rootPath, string message, Exception? innerException = null)
         : base(message, innerException)
     {
         RootPath = rootPath;
@@ -294,7 +294,7 @@ public sealed class BackupInProgressException : Exception
     public string RunningDestination { get; }
 
     /// <summary>Initializes a new instance of <see cref="BackupInProgressException"/>.</summary>
-    public BackupInProgressException(string runningDestination, string message)
+    internal BackupInProgressException(string runningDestination, string message)
         : base(message)
     {
         RunningDestination = runningDestination;
@@ -308,7 +308,7 @@ public sealed class BackupSetNotFoundException : Exception
     public string SetId { get; }
 
     /// <summary>Initializes a new instance of <see cref="BackupSetNotFoundException"/>.</summary>
-    public BackupSetNotFoundException(string setId, string message)
+    internal BackupSetNotFoundException(string setId, string message)
         : base(message)
     {
         SetId = setId;
@@ -325,7 +325,7 @@ public sealed class BackupDamagedException : Exception
     public string Path { get; }
 
     /// <summary>Initializes a new instance of <see cref="BackupDamagedException"/>.</summary>
-    public BackupDamagedException(string path, string message, Exception? innerException = null)
+    internal BackupDamagedException(string path, string message, Exception? innerException = null)
         : base(message, innerException)
     {
         Path = path;
@@ -345,7 +345,7 @@ public sealed class DatabaseUidTakenException : Exception
     public string ExistingName { get; }
 
     /// <summary>Initializes a new instance of <see cref="DatabaseUidTakenException"/>.</summary>
-    public DatabaseUidTakenException(string uid, string existingName, string message)
+    internal DatabaseUidTakenException(string uid, string existingName, string message)
         : base(message)
     {
         Uid = uid;
@@ -369,7 +369,7 @@ public sealed class KeyTooLargeException : Exception
     public int Limit { get; }
 
     /// <summary>Initializes a new instance of <see cref="KeyTooLargeException"/>.</summary>
-    public KeyTooLargeException(string boxName, int keyBytes, int limit, string message)
+    internal KeyTooLargeException(string boxName, int keyBytes, int limit, string message)
         : base(message)
     {
         BoxName = boxName;

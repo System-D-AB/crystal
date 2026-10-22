@@ -47,7 +47,15 @@ public sealed record DatabaseStatus(
     bool Failed,
     string? FailedCause,
     DateTimeOffset? LastWalSync,
-    StorageStatus Storage);
+    StorageStatus Storage)
+{
+    /// <summary>
+    /// The database's latest committed position: the sequence of its last committed write (spec 013 R5). It is the
+    /// position replication speaks in, the same number a standby's slot acknowledges, and it is known with no standby
+    /// attached. It only moves forward while the database is open; a commit that writes nothing does not move it.
+    /// </summary>
+    public long LatestPosition { get; init; }
+}
 
 /// <summary>RocksDB's view of one database, from its properties, summed over its column families.</summary>
 /// <param name="MemtableDeletes">Deletions in memtables, not yet flushed.</param>

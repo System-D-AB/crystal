@@ -39,3 +39,6 @@ GEMINI.md
 .qwen/
 .windsurf/
 .github/copilot-instructions.md
+
+# Spec 015 R3.3: written by PublicApiTests when the public API differs from its baseline; never committed.
+PublicApi.received.txt

@@ -14,16 +14,17 @@ using SystemD.Crystal.Storage;
 namespace SystemD.Crystal;
 
 /// <summary>This node's replication role (spec 003 R6).</summary>
+// Values are explicit and append-only (spec 015 R3.1): they reach metrics, logs and products' switches.
 public enum ReplicationRole
 {
     /// <summary>Serves pulls and accepts writes.</summary>
-    Primary,
+    Primary = 0,
 
     /// <summary>Follows a primary; refuses local writes (R1.6).</summary>
-    Standby,
+    Standby = 1,
 
     /// <summary>Serves nothing (a stood-down former primary).</summary>
-    Fenced,
+    Fenced = 2,
 }
 
 /// <summary>
@@ -38,7 +39,7 @@ public enum ReplicationRole
 /// admitted have ended. They take this object's lock, so other members called meanwhile (<c>Status</c> among them)
 /// wait for them. Events are delivered on Crystal's own thread, never inside these calls.
 /// </remarks>
-public sealed class CrystalReplication : IDisposable
+public sealed class CrystalReplication
 {
     private readonly CrystalStore _store;
     private readonly StoreEngine _engine;
@@ -225,7 +226,31 @@ public sealed class CrystalReplication : IDisposable
     /// The new epoch could not be written to <c>node.epoch</c>. The node did not become a primary: its epoch and role
     /// are unchanged, but it no longer follows. Fix the disk and promote again, or follow a primary.
     /// </exception>
-    public long Promote(string reason)
+    public long Promote(string reason) => PromoteCore(reason, minimumEpoch: 0);
+
+    /// <summary>
+    /// Promotes this node to primary at <c>max(epoch + 1, <paramref name="minimumEpoch"/>)</c>, in one persisted epoch
+    /// write (spec 013 R6): the promotion lands above every epoch the product has heard of — a promotion announce, a
+    /// client that saw a newer primary — without promoting in a loop. Otherwise as <see cref="Promote(string)"/>.
+    /// </summary>
+    /// <param name="reason">Why, for the Promoted event and the log.</param>
+    /// <param name="minimumEpoch">The lowest epoch to promote to; at most 2^62.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="minimumEpoch"/> is negative or above 2^62: no real history reaches it, so it is taken as a garbled
+    /// or hostile value rather than an epoch to adopt, and refused before anything changes.
+    /// </exception>
+    /// <exception cref="System.IO.IOException">As <see cref="Promote(string)"/>.</exception>
+    public long Promote(string reason, long minimumEpoch)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(minimumEpoch);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(minimumEpoch, MaximumEpochFloor);
+        return PromoteCore(reason, minimumEpoch);
+    }
+
+    /// <summary>The highest floor <see cref="Promote(string, long)"/> accepts (2^62): far above any real history.</summary>
+    public const long MaximumEpochFloor = 1L << 62;
+
+    private long PromoteCore(string reason, long minimumEpoch)
     {
         lock (_gate)
         {
@@ -247,7 +272,7 @@ public sealed class CrystalReplication : IDisposable
             // same step under the store gate, so no database opens in between without a history.
             var newEpoch = 0L;
             System.IO.IOException? failure = null;
-            if (!_engine.BeginNewIncarnations(() => _epoch.TryPromote(Storage.ReplicationRole.Primary, out newEpoch, out failure), out var pendingResync))
+            if (!_engine.BeginNewIncarnations(() => _epoch.TryPromote(Storage.ReplicationRole.Primary, out newEpoch, out failure, minimumEpoch), out var pendingResync))
             {
                 // A typed error a failover controller must handle (playbook § 7): the disk, not the caller, is at fault.
                 throw new System.IO.IOException(
@@ -451,6 +476,8 @@ public sealed class CrystalReplication : IDisposable
                 return;
             }
 
+            // Spec 013 R10: a primary fenced here may lift the fence at this same epoch; anything else must promote.
+            _fencedPrimaryAtEpoch = _epoch.Role == Storage.ReplicationRole.Primary ? _epoch.Epoch : null;
             _epoch.SetRole(Storage.ReplicationRole.Fenced);
 
             // A fenced node follows nobody either (R6.5): its follower would otherwise reconnect without pause.
@@ -459,6 +486,51 @@ public sealed class CrystalReplication : IDisposable
             _followedPrimary = null;
             _source?.ClearAllHistory();
             Raise(new ReplicationEvent(ReplicationEventKind.Fenced, _epoch.Epoch, $"fenced: {reason}"));
+        }
+    }
+
+    // The epoch a primary was fenced at by this instance (spec 013 R10); null if it was not a primary when it was fenced.
+    private long? _fencedPrimaryAtEpoch;
+
+    /// <summary>
+    /// Lifts a fence at the same epoch (spec 013 R10): a primary fenced by <see cref="Fence"/> returns to primary at the
+    /// epoch it was fenced at, serving and accepting writes again, and raises an <see cref="ReplicationEventKind.Unfenced"/>
+    /// event. The backstop a product needs when a primary that lost every peer and client fenced itself and contact
+    /// returned: no new epoch, so its standbys continue where they were.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Refused, with the reason, unless this node is fenced, was a primary when it was fenced, and has seen no higher epoch
+    /// since: a fenced standby returning as primary at the same epoch would be a second primary at one epoch (R6.4), and a
+    /// node that has seen a higher epoch is outranked. A restart lifts a fence by failing closed to a standby (spec 003
+    /// R6.5). In each of these cases <see cref="Promote(string)"/>, which takes a new epoch, is the way back.
+    /// </exception>
+    public void Unfence(string reason)
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_epoch.Role != Storage.ReplicationRole.Fenced)
+            {
+                throw new InvalidOperationException($"Unfence refused: this node is not fenced (its role is {_epoch.RoleName}).");
+            }
+
+            if (_fencedPrimaryAtEpoch is not { } fencedAt)
+            {
+                throw new InvalidOperationException(
+                    "Unfence refused: this node was not a primary when it was fenced, so serving as one at this epoch would " +
+                    "make a second primary at it. Promote it instead, which takes a new epoch.");
+            }
+
+            if (_epoch.Epoch != fencedAt)
+            {
+                throw new InvalidOperationException(
+                    $"Unfence refused: this node was fenced at epoch {fencedAt} and has since seen epoch {_epoch.Epoch}; " +
+                    "another node has been primary. Promote it instead, which takes a new epoch.");
+            }
+
+            _fencedPrimaryAtEpoch = null;
+            _epoch.SetRole(Storage.ReplicationRole.Primary);
+            Raise(new ReplicationEvent(ReplicationEventKind.Unfenced, _epoch.Epoch, $"unfenced: {reason}"));
         }
     }
 
@@ -569,12 +641,13 @@ public sealed class CrystalReplication : IDisposable
             case ReplicationEventKind.FormatRefused: Observability.CrystalLog.ReplicationFormatRefused(_logger, e.Epoch, e.Detail); break;
             case ReplicationEventKind.Conflict: Observability.CrystalLog.ReplicationConflict(_logger, e.Epoch, e.Detail); break;
             case ReplicationEventKind.PromotedWithPendingResync: Observability.CrystalLog.ReplicationPromotedWithPendingResync(_logger, e.Epoch, e.Detail); break;
+            case ReplicationEventKind.Unfenced: Observability.CrystalLog.ReplicationUnfenced(_logger, e.Epoch, e.Detail); break;
         }
     }
 
     /// <summary>
     /// This node's replication status (spec 003 R13.2): role, epoch, the primary it follows (if any), and the recent
-    /// transition log. Surfaced in <see cref="CrystalStore.Status"/> and the protocol's <c>STATUS</c>.
+    /// transition log. Read here, not in <see cref="CrystalStore.Status"/>; the protocol's <c>STATUS</c> reports the same.
     /// </summary>
     public ReplicationStatus Status()
     {
@@ -590,7 +663,7 @@ public sealed class CrystalReplication : IDisposable
         {
             source = _source;
             status = new ReplicationStatus(
-                _epoch.RoleName,
+                Role,
                 _epoch.Epoch,
                 _followedPrimary,
                 _listener?.Endpoint.ToString(),
@@ -599,7 +672,13 @@ public sealed class CrystalReplication : IDisposable
         }
 
         // Read outside the lock: aging slots may raise events, which must not wait on it.
-        status = status with { Followed = Followed() };
+        var follower = Volatile.Read(ref _follower);
+        status = status with
+        {
+            Followed = Followed(),
+            ConnectedToPrimary = follower?.Connected ?? false,
+            LastReplyFromPrimary = follower?.LastReply,
+        };
         return source is null ? status : status with { Slots = source.Slots() };
     }
 
@@ -621,8 +700,11 @@ public sealed class CrystalReplication : IDisposable
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-    /// <summary>Stops the listener and the follower loop and releases their resources. Called by the store on close.</summary>
-    public void Dispose()
+    /// <summary>
+    /// Stops the listener and the follower loop and releases their resources. Called by the store on close; the store owns
+    /// its replication, so this is not public (spec 015 R3.1): disposing it would stop replication under an open store.
+    /// </summary>
+    internal void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
@@ -650,16 +732,16 @@ public sealed class CrystalReplication : IDisposable
 
 /// <summary>
 /// A node's replication status (spec 003 R13.2): role, epoch, the primary it follows, its listener endpoint, and a
-/// bounded log of recent transitions. In <see cref="CrystalStore.Status"/> and the protocol's <c>STATUS</c>.
+/// bounded log of recent transitions. From <see cref="CrystalReplication.Status"/>; the protocol's <c>STATUS</c> reports the same.
 /// </summary>
-/// <param name="Role">This node's role: <c>primary</c>, <c>standby</c> or <c>fenced</c>.</param>
+/// <param name="Role">This node's role, as <see cref="CrystalReplication.Role"/>.</param>
 /// <param name="Epoch">This node's current epoch.</param>
 /// <param name="FollowedPrimary">The endpoint this node follows as a standby, or null.</param>
 /// <param name="ListenerEndpoint">The endpoint this node's listener is bound to, or null if not listening.</param>
 /// <param name="RecentTransitions">A bounded log of recent role/epoch/slot transitions (newest last).</param>
 /// <param name="Slots">On a primary, each standby's slot per database (R2.2, R2.4); empty otherwise.</param>
 public sealed record ReplicationStatus(
-    string Role,
+    ReplicationRole Role,
     long Epoch,
     string? FollowedPrimary,
     string? ListenerEndpoint,
@@ -668,6 +750,22 @@ public sealed record ReplicationStatus(
 {
     /// <summary>The databases this node follows as a standby, with position and lag (spec 011 R10.4); empty on a primary.</summary>
     public IReadOnlyList<FollowedDatabase> Followed { get; init; } = [];
+
+    /// <summary>
+    /// Whether this node, as a standby, holds an authenticated connection to the primary it follows now (spec 013 R8.2):
+    /// false on a primary, while reconnecting, and when the primary is unreachable. With
+    /// <see cref="LastReplyFromPrimary"/>, what a product needs to tell a follower parked in a long poll from one whose
+    /// primary vanished.
+    /// </summary>
+    public bool ConnectedToPrimary { get; init; }
+
+    /// <summary>
+    /// When this node, as a standby, last read a reply from its primary: a page, an empty long-poll reply, a snapshot
+    /// chunk, the handshake (spec 013 R8.1); null until the first. While the link is healthy it is never older than
+    /// <see cref="ReplicationOptions.LongPollMax"/> plus one round trip, the longest a caught-up pull waits for its reply
+    /// (R8.3); older means the link is in trouble. It describes the connection, which serves every followed database.
+    /// </summary>
+    public DateTimeOffset? LastReplyFromPrimary { get; init; }
 }
 
 /// <summary>A database handed over by <see cref="CrystalReplication.StepDownAsync"/> (spec 011 R14.2): its final position.</summary>
@@ -688,19 +786,20 @@ public sealed record SteppedDownDatabase(string Uid, string Name, long Position)
 public sealed record FollowedDatabase(string Uid, string Name, long Position, long PrimaryLatest, long Lag);
 
 /// <summary>A standby slot's state (spec 003 R2.3).</summary>
+// Values are explicit and append-only (spec 015 R3.1): they reach metrics, logs and products' switches.
 public enum ReplicationSlotState
 {
     /// <summary>In contact and within a quarter of the lag cap.</summary>
-    Active,
+    Active = 0,
 
     /// <summary>More than a quarter of the lag cap behind.</summary>
-    Lagging,
+    Lagging = 1,
 
     /// <summary>
     /// Past the lag cap, or silent past <c>SlotStaleAfter</c>. An observation, never a hold: the standby resumes on its
     /// next contact if the log still reaches it, or meets a gap and re-bootstraps.
     /// </summary>
-    Dropped,
+    Dropped = 2,
 }
 
 /// <summary>

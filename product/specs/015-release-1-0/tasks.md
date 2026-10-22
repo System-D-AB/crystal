@@ -25,21 +25,48 @@
 
 ## Phase C — the API (R3, R4)
 
-- [ ] **T9** The public API baseline file and its architecture test (design § 4).
-- [ ] **T10** `013` R5 `DatabaseStatus.LatestPosition` and R9 `BoxCatalog.ListBoxes()` (the small ones), with `013`'s
-  tests and the baseline updated.
-- [ ] **T11** `013` R6 `Promote(reason, minimumEpoch)`, one persisted epoch write.
-- [ ] **T12** `013` R8 `FollowedDatabase.LastReply` and `ReplicationStatus.FollowerConnected`.
-- [ ] **T13** `013` R4 `CrystalStore.Compact` (offline, refused while open, per-database before/after/time, the
-  no-data-change test).
-- [ ] **T14** The API review (R3.1) by a fresh agent or contributor, its findings fixed or recorded (R3.2). The
+- [x] **T9** The public API baseline file and its architecture test (design § 4). _Done 2026-10-22: `PublicApiTests` lists every public type and member (kind, modifiers, bases, parameters, nullability, `init`/`set`, constants, enum values) and compares with `PublicApi.txt`; a difference fails, names every line added and removed, and writes `PublicApi.received.txt` (git-ignored). It caught each addition below, and nothing removed._
+- [x] **T10** `013` R5 `DatabaseStatus.LatestPosition` and R9 `BoxCatalog.ListBoxes()` (the small ones), with `013`'s
+  tests and the baseline updated. _Done: `DatabaseStatus.LatestPosition` (an `init` property, the constructor unchanged) and `BoxCatalog.ListBoxes()` (handles from the issuing catalogue; another database refuses them). Tests in `Adoption/HighwayFeatureTests`._
+- [x] **T11** `013` R6 `Promote(reason, minimumEpoch)`, one persisted epoch write. _Done: `Promote(reason, minimumEpoch)` lands on `max(epoch + 1, floor)` in one persisted write; a floor below 0 or above 2^62 (`MaximumEpochFloor`) is refused before anything changes. Tests in `Replication/HighwayReplicationFeatureTests`._
+- [x] **T12** `013` R8 `FollowedDatabase.LastReply` and `ReplicationStatus.FollowerConnected`. _Done: `ReplicationClient` reports every reply read; the follower stamps `LastReply` and keeps `FollowerConnected` from the handshake to the end of its main connection. Test: a real pair, connected and replying while idle, then not connected and silent once the primary closes._
+- [x] **T13** `013` R4 `CrystalStore.Compact` (offline, refused while open, per-database before/after/time, the
+  no-data-change test). _Done: `CrystalStore.Compact` opens the store (lock, format), refuses an unknown name before compacting anything, compacts each database end to end, and reports data-file bytes (table files and WAL, not diagnostic logs) before and after. Tests: no data changes across point and range deletes in two databases and both profiles; no level-0 file left; refused while open. Mutation: compaction removed fails it (by level 0; size alone did not, as RocksDB drops deleted data on its own). The architecture rule on clocks caught a direct `TimeProvider.System`, fixed._
+- [x] **T13a** `013` R10 `CrystalReplication.Unfence()` and the `Unfenced` event (R4.5, D2): a fenced node that has seen
+  no higher epoch returns to primary at its epoch; refused otherwise, naming why. _Done: `Unfence` returns a primary fenced here to primary at its epoch and raises `Unfenced` (log 2015); refused when not fenced, when the node was not a primary when fenced (a second primary at one epoch), or when a higher epoch was seen. A restart lifts a fence by failing closed to a standby (003 R6.5), so Promote is the way back then._
+- [x] **T14** The API review (R3.1) by a fresh agent or contributor, its findings fixed or recorded (R3.2). The
   CHANGELOG's semantic-versioning line (R3.4).
+  *Done 2026-10-22.* An independent reviewer read the whole public surface (the baseline in `PublicApi.txt`).
+  Fixed, each one incompatible to fix after 1.0:
+  - `Box` was a positional record struct: `with` could forge a handle that passed the ownership check. Now a
+    `readonly struct` with internal constructors, equal by id and owning database.
+  - `CrystalVersion.Value` was a `const`, baked into callers at compile time: now a property.
+  - `CrystalReplication` was `IDisposable` though the store owns it: no longer.
+  - `ReplicationStatus.Role` was a string: now `ReplicationRole`.
+  - `BoxLocks.Lock`, `LockMany`, `LockAll` returned `IDisposable`: now `LockLease`, like the rest.
+  - `ApproximateBytes` returned `ulong`: now `long`, like every other byte count.
+  - Exception constructors were public: now internal (the NodeHost test tool has its own exception).
+  - `CompactOptions` was a record: now a class, like the other options.
+  - The standby link moved from `FollowerConnected` and `FollowedDatabase.LastReply` to
+    `ReplicationStatus.ConnectedToPrimary` and `LastReplyFromPrimary` (one primary, not one per database).
+  - `BoxCatalog.ListBoxes()` was dropped for `BoxInfo.Handle` on `List()`: one listing, not two.
+  - `ReplicationEventKind`, `ReplicationRole`, `ReplicationSlotState`: explicit values, append-only.
+  Kept on purpose:
+  - `CreateDatabase(name, bool replicated)` and the backup `Open`/`VerifyAsync` shapes: an options overload can be
+    added in 1.x, since its parameter is required and doesn't collide.
+  - The naming suggestions (renames for taste) and `EventArgs`-style event naming: no defect, and a rename now costs
+    every adopter.
+  - Typed replication exceptions in place of `InvalidOperationException`: derived types can be added in 1.x.
+  - The positional records for status and results: their shape is the contract.
+  Architecture 18, unit 698 (LongProbe filtered, 2 m), process 24: all pass on Windows.
 
 ## Phase D — numbers (R5)
 
-- [ ] **T15** `008` T15: the harness's independent review, findings fixed.
-- [ ] **T16** `013` T1, T2: the `command` workload, the RocksDB baseline runner, and the `full` run on Windows and
-  Linux, recorded. README and CHANGELOG claims cite it (R5.3).
+*Moved to 1.x by D7 (R5.4), 2026-10-22: Highway running the candidate is the measurement.*
+
+- ~~**T15** `008` T15: the harness's independent review, findings fixed.~~
+- ~~**T16** `013` T1, T2: the `command` workload, the RocksDB baseline runner, and the `full` run on Windows and
+  Linux, recorded. README and CHANGELOG claims cite it (R5.3).~~
 
 ## Phase E — release gates (R6)
 
@@ -61,7 +88,6 @@
 
 ## Moved to 1.x (R9)
 
-- `013` R10 `Unfence()`: Highway keeps its own write gate (D2).
 - `012` T10, T11 `CrystalSequence` and its crash test; `012` T15 lighter batches (D3).
 - `004` T2, T5–T8, T13, T14 (porting Highway's test helpers and suites): checked against the suite as it is; what the
   current tests already cover is closed with a note, the rest moves here.

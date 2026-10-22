@@ -169,4 +169,7 @@ public static class CrystalLogEvents
 
     /// <summary>Error: a handler of <c>CrystalReplication.Events</c> threw; the events after it are still delivered (spec 011 R5.3).</summary>
     public static readonly EventId ReplicationEventHandlerFailed = new(2014, nameof(ReplicationEventHandlerFailed));
+
+    /// <summary>A fenced primary returned to primary at the same epoch (spec 013 R10).</summary>
+    public static readonly EventId ReplicationUnfenced = new(2015, nameof(ReplicationUnfenced));
 }

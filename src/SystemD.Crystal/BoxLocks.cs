@@ -51,13 +51,13 @@ public sealed class BoxLocks
     private static int StripeOf(uint boxId) => (int)(boxId % StripeCount);
 
     /// <summary>Acquires the lock for <paramref name="box"/>. Dispose the result to release it.</summary>
-    public IDisposable Lock(Box box) => Take([StripeOf(box.Id)]);
+    public LockLease Lock(Box box) => Leased(Take([StripeOf(box.Id)]));
 
     /// <summary>
     /// Acquires the locks for all distinct stripes of <paramref name="boxes"/>, in ascending stripe order (R5.2). Two
     /// boxes sharing a stripe take it once.
     /// </summary>
-    public IDisposable LockMany(IEnumerable<Box> boxes)
+    public LockLease LockMany(IEnumerable<Box> boxes)
     {
         ArgumentNullException.ThrowIfNull(boxes);
 
@@ -67,11 +67,11 @@ public sealed class BoxLocks
             stripes.Add(StripeOf(box.Id));
         }
 
-        return Take([.. stripes]);
+        return Leased(Take([.. stripes]));
     }
 
     /// <summary>Acquires every stripe, in the same ascending order as <see cref="LockMany"/> (R5.3).</summary>
-    public IDisposable LockAll()
+    public LockLease LockAll()
     {
         _metrics?.LockAll();
         var all = new int[StripeCount];
@@ -80,8 +80,11 @@ public sealed class BoxLocks
             all[i] = i;
         }
 
-        return Take(all);
+        return Leased(Take(all));
     }
+
+    /// <summary>The synchronous locks return the same lease type as the asynchronous ones and as key locks (spec 015 R3.1).</summary>
+    private static LockLease Leased(IDisposable held) => new(held.Dispose);
 
     /// <summary>
     /// Acquires the lock for <paramref name="box"/> without blocking a thread (spec 012 R3.4). Dispose the result, or
