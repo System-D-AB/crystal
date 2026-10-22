@@ -36,7 +36,7 @@ Also in the box:
 - **Observability:** stable log event ids and `System.Diagnostics.Metrics` instruments; a status snapshot.
 - **Format stamps:** a directory this build cannot read is refused by name, with the way forward.
 
-> **Status: 1.0.0-rc.2,** a release candidate for 1.0. Tested on Windows and Linux.
+> **Status: 1.0.0-rc.3,** a release candidate for 1.0, with the public API frozen. Tested on Windows and Linux.
 
 ## Platform
 

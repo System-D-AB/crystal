@@ -6,7 +6,7 @@
 > pack produces the package + symbols). **T1 deliberately not run** — the maintainer is removing content before
 > the first push, so no git repository or commit exists yet. See the addendum in `requirements.md`.
 
-- [ ] **T1** Initialize the git repository and `.gitignore`; first commit only on the maintainer's go-ahead (R2.4,
+- [x] **T1** Initialize the git repository and `.gitignore`; first commit only on the maintainer's go-ahead (R2.4,
   open question 5). Done when `git status` is clean apart from the intended files.
   _Not run: git deliberately deferred at the maintainer's request. `.gitignore` is written; `git init` and the
   first commit are left for after content is removed and the repository name (OQ5) is chosen._
@@ -22,9 +22,10 @@
   manual mutate-and-revert; each rule function is shown to catch its violation._
 - [x] **T6** The native smoke test (R4.1). Done when it passes locally on Windows. _Done: opens RocksDB in a temp
   dir through the internal seam, writes key [00 00 00 10 01]="x", reads it back, deletes the dir. Passes on Windows._
-- [ ] **T7** CI workflow on Windows and Linux (R6.1, R6.2). Done when both legs are green, and the smoke test has run
+- [x] **T7** CI workflow on Windows and Linux (R6.1, R6.2). Done when both legs are green, and the smoke test has run
   on both (R4.2). _Workflow written (`.github/workflows/build.yml`): restore, build, test (trx artifacts), pack,
   upload. Not yet observed green — no repository exists to run it. Reopen when T1 is run._
+  _Closed 2026-10-22 (spec `015` T4): green on both legs, `windows-2025` and `ubuntu-24.04`._
 - [x] **T8** Package metadata; `dotnet pack` produces the one `SystemD.Crystal` package with symbols (R5.1, R5.2). Done
   when the package builds and nothing is published. _Done: `0.1.0-preview.1`, MIT expression, README embedded,
   `.nupkg` + `.snupkg`, RocksDB pinned in the dependency group. Nothing published. RepositoryUrl is a placeholder

@@ -124,6 +124,10 @@ goes to production on this release, so what its operators and its failover need 
   fixed in a new release candidate and the window starts again.
 - **R7.5** **Rollback** is defined before cut-over: Highway's previous release on its previous store, reached by its
   drain-and-wipe runbook in reverse. There is no in-place rollback of data (Highway `076` R3.2); the runbook says so.
+- **R7.6** *(Decided by the maintainer 2026-10-22, D8.)* **Highway's approval of rc.3 releases 1.0.** Highway ran
+  its gates against the rc.3 package from the local feed and approved it; 1.0.0 is released from it without the soak
+  and canary of R7.2–R7.4 first. Those run on 1.0.0 in Highway's production instead, and what they find is fixed in
+  1.0.x. rc.3 is tagged as the commit Highway approved, and not published to NuGet.
 
 ### R8 — 1.0.0 is that candidate, renamed
 
@@ -154,3 +158,4 @@ goes to production on this release, so what its operators and its failover need 
 | D5 | Which Highway deployment is the canary, and who runs its runbook | the maintainer |
 | D6 | Highway-side work (gates, runbooks) done by whom, in Highway's repository | the maintainer |
 | D7 | Benchmark runs in this repository for 1.0 (R5) | **Decided 2026-10-22: none; Highway is the measurement (R5.4)** |
+| D8 | What releases 1.0 | **Decided 2026-10-22: Highway's approval of rc.3; soak and canary on 1.0.0 in production (R7.6)** |

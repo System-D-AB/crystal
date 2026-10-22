@@ -70,15 +70,19 @@
 
 ## Phase E — release gates (R6)
 
-- [ ] **T17** `tools/release-gate` (design § 5) running `004` R4.1, appending to `engineering/measurements.md`.
-  Closes `004` T15, T16.
-- [ ] **T18** Pack **1.0.0-rc.3** to a local feed (not published) and run the gate on Windows and Linux.
-- [ ] **T19** Highway's gates against rc.3 from the local feed (R6.2), in Highway's repository by whoever D6 names;
+- ~~**T17** `tools/release-gate` (design § 5) running `004` R4.1, appending to `engineering/measurements.md`.
+  Closes `004` T15, T16.~~ *Moved to 1.x (D8): CI on both platforms and Highway's gates were the gate for 1.0.*
+- [x] **T18** Pack **1.0.0-rc.3** to a local feed (not published) and run the gate on Windows and Linux.
+  *Done 2026-10-22.* Packed to a local folder from `b0a05cf` plus the version change; CI green on `windows-2025`
+  and `ubuntu-24.04` for `b0a05cf`.
+- [x] **T19** Highway's gates against rc.3 from the local feed (R6.2), in Highway's repository by whoever D6 names;
   results recorded here. Any failure caused by Crystal is fixed and T18 repeated.
+  *Done 2026-10-22.* Run by the maintainer in Highway's repository; Highway approved rc.3.
 
 ## Phase F — production (R7, R8)
 
-- [ ] **T20** Commit, tag `v1.0-rc3` and publish 1.0.0-rc.3 (the maintainer's go-ahead for each).
+- [x] **T20** Commit, tag `v1.0-rc3` and publish 1.0.0-rc.3 (the maintainer's go-ahead for each).
+  *Done 2026-10-22: committed and tagged; not published to NuGet (D8), since 1.0.0 follows from the same commit.*
 - [ ] **T21** Staging soak, 72 hours (R7.2; D4), one pair on Linux and one on Windows, with daily kill, handover and restart; signals per design § 6;
   results recorded.
 - [ ] **T22** Production canary (R7.3), one deployment on Linux and one on Windows: cut-over by Highway's runbook, a planned failover drill, the window of D4;

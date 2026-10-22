@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.3
 
 No format, catalogue, encoder or protocol change; a few source-breaking API changes from the review before the
 freeze, listed below. From 1.0 the public API follows semantic versioning,

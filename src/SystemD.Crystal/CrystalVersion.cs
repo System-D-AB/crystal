@@ -10,5 +10,5 @@ public static class CrystalVersion
     /// A property, not a constant (spec 015 R3.1): a constant is copied into the application at compile time, so an
     /// application built against one version would report it while running on another.
     /// </remarks>
-    public static string Value { get; } = "1.0.0-rc.2";
+    public static string Value { get; } = "1.0.0-rc.3";
 }
