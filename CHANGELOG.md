@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0
+
+1.0.0-rc.3 with only the version changed. Highway ran its gates against rc.3 and approved it; it runs on 1.0.0 in
+production. From here the public API follows semantic versioning, recorded in
+`tests/SystemD.Crystal.Architecture.Tests/PublicApi.txt`.
+
 ## 1.0.0-rc.3
 
 No format, catalogue, encoder or protocol change; a few source-breaking API changes from the review before the

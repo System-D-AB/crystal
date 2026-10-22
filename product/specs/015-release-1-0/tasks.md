@@ -87,8 +87,10 @@
   results recorded.
 - [ ] **T22** Production canary (R7.3), one deployment on Linux and one on Windows: cut-over by Highway's runbook, a planned failover drill, the window of D4;
   signals reviewed at least daily and recorded here.
-- [ ] **T23** 1.0.0 (R8): version change only, from the candidate that held; commit, tag `v1.0`, publish, release notes
+- [x] **T23** 1.0.0 (R8): version change only, from the candidate that held; commit, tag `v1.0`, publish, release notes
   stating what was proven and where (each step with the maintainer's go-ahead).
+  *Done 2026-10-22 from rc.3 (`v1.0-rc3`), on Highway's approval (D8); committed and tagged `v1.0`. Published to
+  NuGet by the maintainer. T21 and T22 run on 1.0.0 in Highway's production.*
 
 ## Moved to 1.x (R9)
 

@@ -12,12 +12,12 @@
   <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>SystemD.Crystal</PackageId>
-    <Version>1.0.0-rc.3</Version>
+    <Version>1.0.0</Version>
     <Authors>SystemD.Crystal contributors</Authors>
     <Description>An embeddable storage engine for .NET, built on a write-ahead log over RocksDB: databases, boxes (named ordered key spaces) and records; atomic batches across boxes; snapshots and bounded ordered scans; durability you choose; primary/standby replication; incremental online backup and restore; format stamps.</Description>
     <PackageTags>storage;embedded;key-value;database;rocksdb;wal;replication;backup</PackageTags>
     <PackageProjectUrl>https://github.com/System-D-AB/crystal</PackageProjectUrl>
-    <PackageReleaseNotes>Third 1.0 release candidate, with the public API frozen for 1.0: offline compaction, a database's latest position, promotion past an epoch floor, unfencing at the same epoch, a standby's link to its primary, and box handles from the catalogue listing. A few source-breaking changes from rc.2 (Box, ReplicationStatus.Role, box locks, ApproximateBytes, exception constructors); see CHANGELOG.md in the repository. Tested on Windows and Linux.</PackageReleaseNotes>
+    <PackageReleaseNotes>1.0.0: 1.0.0-rc.3 with only the version changed, approved by Highway, a product running on it. The public API follows semantic versioning from here. New since rc.2: offline compaction, a database's latest position, promotion past an epoch floor, unfencing at the same epoch, a standby's link to its primary, and box handles from the catalogue listing. Source-breaking changes from rc.2 (Box, ReplicationStatus.Role, box locks, ApproximateBytes, exception constructors); see CHANGELOG.md in the repository. Tested on Windows and Linux.</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryUrl>https://github.com/System-D-AB/crystal.git</RepositoryUrl>
